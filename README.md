@@ -12,6 +12,11 @@ A production-grade Retrieval-Augmented Generation (RAG) system for telecom docum
 - **REST API**: FastAPI endpoint with file upload and question answering
 - **Evaluation Suite**: Golden dataset, Recall@k, MRR, and LLM-as-a-judge faithfulness metrics
 - **CI/CD**: GitHub Actions workflow for automated evaluation
+- **Enhanced Knowledge Base**: Four detailed telecom documents added:
+  - *eSIM_document.txt*: Comprehensive eSIM technology, benefits, GSMA specifications
+  - *Roaming_document.txt*: Roaming agreements, procedures, steered vs non-steered roaming
+  - *LTE_5G_document.txt*: LTE/5G network architecture, specifications, and evolution
+  - *SIM_Security_document.txt*: SIM authentication, AKA protocol, and security mechanisms
 
 ## Project Structure
 
@@ -30,6 +35,9 @@ Telecom RAG System/
 │   └── evaluation_results.json # Latest evaluation results
 ├── data/
 │   └── uploads/        # Uploaded PDF and TXT documents
+├── docs/
+│   ├── RAG_Situations_Explained.md   # Educational document on RAG system behaviors
+│   └── System_Explanations_For_Kids.md   # Simple explanations for interview preparation
 ├── static/             # Static web assets
 ├── templates/          # HTML templates
 ├── requirements.txt    # Python dependencies
@@ -94,6 +102,12 @@ This RAG system is specifically designed for telecom documentation including:
 - LTE/5G network specifications
 - SIM security and authentication protocols
 - Carrier configuration requirements
+
+## Documentation
+
+In addition to the codebase, this system includes educational materials:
+- **RAG_Situations_Explained.md**: Explains common RAG system behaviors including successful retrieval, failed retrieval, hallucination, citation issues, edge cases, and best practices
+- **System_Explanations_For_Kids.md**: Simple explanations of each system component using analogies suitable for interview preparation (written at a 10-year-old's level)
 
 ## Contributing
 
