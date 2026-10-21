@@ -1,0 +1,17 @@
+CHUNKING STRATEGY COMPARISON
+================================================================================
+Strategy       Chunks  Avg Size  Min Size  Max Size  Bad Split Example
+fixed_size     45      498.2     120       512       "...accrue at 6.67 hours per month for the first 5 years of serv"
+recursive      38      587.6     85        620       No bad splits found in first 5 chunks
+structure_aware 42     521.3     95        550       "...requests must be submitted at least two weeks in advance for p"
+
+================================================================================
+Notes: All strategies used chunk_size=500, overlap=50
+Bad split example shows a chunk that doesn't end at a natural boundary
+================================================================================
+
+Analysis:
+1. Fixed-size strategy produces the most consistent chunk sizes but has boundary issues (bad splits)
+2. Recursive strategy creates fewer, larger chunks by respecting paragraph boundaries, minimizing bad splits
+3. Structure-aware strategy balances document structure with size constraints, producing good results for markdown content
+4. For RAG applications, recursive or structure-aware strategies generally outperform fixed-size pure approaches

@@ -1,0 +1,244 @@
+{
+  "questions": [
+    {
+      "id": "q1",
+      "question": "What is Acme Corp's policy on remote work?",
+      "expected_answer_contains": ["remote work", "eligible employees", "3 days per week", "manager approval"],
+      "expected_sources": ["hr_remote_work_policy.md"],
+      "question_type": "factual",
+      "hop_count": 1
+    },
+    {
+      "id": "q2",
+      "question": "How many days of paid leave do employees receive per year?",
+      "expected_answer_contains": ["80 hours per year", "first 5 years", "6.67 hours per month"],
+      "expected_sources": ["hr_leave_policy.md"],
+      "question_type": "factual",
+      "hop_count": 1
+    },
+    {
+      "id": "q3",
+      "question": "What are the password requirements for Acme Corp's IT security policy?",
+      "expected_answer_contains": ["12 characters long", "uppercase letters", "lowercase letters", "numbers", "special characters", "changed every 90 days"],
+      "expected_sources": ["it_security_policy.md"],
+      "question_type": "factual",
+      "hop_count": 1
+    },
+    {
+      "id": "q4",
+      "question": "What is the procedure for reporting a security incident?",
+      "expected_answer_contains": ["reported to the IT Security team within one hour", "Incident Response Plan", "IRP-001"],
+      "expected_sources": ["it_security_policy.md"],
+      "question_type": "factual",
+      "hop_count": 1
+    },
+    {
+      "id": "q5",
+      "question": "What products does Acme Corp offer according to the FAQ?",
+      "expected_answer_contains": ["AcmeCloud Storage Service", "AcmeCompute Virtual Machines", "AcmeDB Managed Database"],
+      "expected_sources": ["product_faq.md", "pricing_guide.md"],
+      "question_type": "factual",
+      "hop_count": 1
+    },
+    {
+      "id": "q6",
+      "question": "What is the starting price for Acme Corp's consulting services?",
+      "expected_answer_contains": ["$150", "hour"],
+      "expected_sources": ["pricing_guide.md"],
+      "question_type": "factual",
+      "hop_count": 1
+    },
+    {
+      "id": "q7",
+      "question": "What is the onboarding process for new employees?",
+      "expected_answer_contains": ["benefits eligibility", "first day of the month following 30 days of employment", "orientation"],
+      "expected_sources": ["employee_handbook.md"],
+      "question_type": "factual",
+      "hop_count": 1
+    },
+    {
+      "id": "q8",
+      "question": "How does Acme Corp handle version conflicts in documentation?",
+      "expected_answer_contains": ["obsolete", "replaced by", "latest version", "effective date"],
+      "expected_sources": ["hr_leave_policy_v1.0.md", "hr_leave_policy.md"],
+      "question_type": "factual",
+      "hop_count": 1
+    },
+    {
+      "id": "q9",
+      "question": "What is the maximum object size I can store in AcmeCloud?",
+      "expected_answer_contains": ["5 TB", "multipart upload capability"],
+      "expected_sources": ["product_faq.md"],
+      "question_type": "factual",
+      "hop_count": 1
+    },
+    {
+      "id": "q10",
+      "question": "How does AcmeCloud ensure data durability?",
+      "expected_answer_contains": ["redundantly across multiple devices", "erasure coding", "checksums"],
+      "expected_sources": ["product_faq.md"],
+      "question_type": "factual",
+      "hop_count": 1
+    },
+    {
+      "id": "q11",
+      "question": "What is the maximum PTO carryover allowed from one year to the next according to the current policy?",
+      "expected_answer_contains": ["40 hours", "excess accrued beyond the carryover limit will be forfeited"],
+      "expected_sources": ["hr_leave_policy.md"],
+      "question_type": "factual",
+      "hop_count": 1
+    },
+    {
+      "id": "q12",
+      "question": "What was the maximum PTO carryover allowed in the previous version of the policy?",
+      "expected_answer_contains": ["20 hours"],
+      "expected_sources": ["hr_leave_policy_v1.0.md"],
+      "question_type": "factual",
+      "hop_count": 1
+    },
+    {
+      "id": "q13",
+      "question": "How does the PTO accrual rate change after 5 years of service?",
+      "expected_answer_contains": ["10 hours per month", "120 hours per year", "after 5 years of service"],
+      "expected_sources": ["hr_leave_policy.md"],
+      "question_type": "factual",
+      "hop_count": 1
+    },
+    {
+      "id": "q14",
+      "question": "What are the core collaboration hours for remote workers at Acme Corp?",
+      "expected_answer_contains": ["10:00 AM to 3:00 PM local time"],
+      "expected_sources": ["hr_remote_work_policy.md"],
+      "question_type": "factual",
+      "hop_count": 1
+    },
+    {
+      "id": "q15",
+      "question": "What equipment does Acme Corp provide for remote work?",
+      "expected_answer_contains": ["laptop", "monitor", "necessary peripherals"],
+      "expected_sources": ["hr_remote_work_policy.md"],
+      "question_type": "factual",
+      "hop_count": 1
+    },
+    {
+      "id": "q16",
+      "question": "What is the internet reimbursement amount for remote employees?",
+      "expected_answer_contains": ["$50", "monthly stipend", "internet service costs"],
+      "expected_sources": ["hr_remote_work_policy.md"],
+      "question_type": "factual",
+      "hop_count": 1
+    },
+    {
+      "id": "q17",
+      "question": "What security measures are required for remote logins to Acme Corp networks?",
+      "expected_answer_contains": ["Multi-factor authentication (MFA)", "company VPN"],
+      "expected_sources": ["hr_remote_work_policy.md", "it_security_policy.md"],
+      "question_type": "factual",
+      "hop_count": 2
+    },
+    {
+      "id": "q18",
+      "question": "How does Acme Corp's leave policy compare to industry standards?",
+      "expected_answer_contains": ["cannot be determined", "not specified", "no information available"],
+      "expected_sources": [],
+      "question_type": "unanswerable",
+      "hop_count": 0
+    },
+    {
+      "id": "q19",
+      "question": "What is the CEO's salary at Acme Corp?",
+      "expected_answer_contains": ["cannot be determined", "not specified", "no information available"],
+      "expected_sources": [],
+      "question_type": "unanswerable",
+      "hop_count": 0
+    },
+    {
+      "id": "q20",
+      "question": "What are the key components of Acme Corp's incident response process?",
+      "expected_answer_contains": ["reported to the IT Security team within one hour", "contain, eradicate, and recover", "post-incident reviews"],
+      "expected_sources": ["it_security_policy.md"],
+      "question_type": "factual",
+      "hop_count": 1
+    },
+    {
+      "id": "q21",
+      "question": "What encryption standards does Acme Corp use for data protection?",
+      "expected_answer_contains": ["AES-256 encryption", "TLS 1.2 or higher", "WPA3 encryption"],
+      "expected_sources": ["it_security_policy.md"],
+      "question_type": "factual",
+      "hop_count": 1
+    },
+    {
+      "id": "q22",
+      "question": "How does AcmeCloud pricing work for storage usage?",
+      "expected_answer_contains": ["First 50 TB: $0.023", "Next 450 TB: $0.022", "Over 500 TB: $0.021", "per GB per month"],
+      "expected_sources": ["pricing_guide.md"],
+      "question_type": "factual",
+      "hop_count": 1
+    },
+    {
+      "id": "q23",
+      "question": "What discounts does Acme Corp offer for long-term storage commitments?",
+      "expected_answer_contains": ["reserved storage pricing", "1 or 3 years", "up to 40% discount"],
+      "expected_sources": ["product_faq.md", "pricing_guide.md"],
+      "question_type": "factual",
+      "hop_count": 2
+    },
+    {
+      "id": "q24",
+      "question": "What is the maternity leave policy at Acme Corp?",
+      "expected_answer_contains": ["cannot be determined", "not specified", "no information available"],
+      "expected_sources": [],
+      "question_type": "unanswerable",
+      "hop_count": 0
+    },
+    {
+      "id": "q25",
+      "question": "How do employees request PTO for planned vacation?",
+      "expected_answer_contains": ["requests should be submitted at least two weeks in advance", " Acme Corp time-off system"],
+      "expected_sources": ["hr_leave_policy.md"],
+      "question_type": "factual",
+      "hop_count": 1
+    },
+    {
+      "id": "q26",
+      "question": "What happens to unused PTO upon termination at Acme Corp?",
+      "expected_answer_contains": ["Unused PTO is not paid out upon termination unless required by state law"],
+      "expected_sources": ["hr_leave_policy.md"],
+      "question_type": "factual",
+      "hop_count": 1
+    },
+    {
+      "id": "q27",
+      "question": "How does the previous leave policy handle unused PTO payout?",
+      "expected_answer_contains": ["Unused PTO is paid out upon termination at a rate of 50% of the accrued balance"],
+      "expected_sources": ["hr_leave_policy_v1.0.md"],
+      "question_type": "factual",
+      "hop_count": 1
+    },
+    {
+      "id": "q28",
+      "question": "What network security measures does Acme Corp employ?",
+      "expected_answer_contains": ["firewalls", "Intrusion Detection Systems (IDS)", "WPA3 encryption"],
+      "expected_sources": ["it_security_policy.md"],
+      "question_type": "factual",
+      "hop_count": 1
+    },
+    {
+      "id": "q29",
+      "question": "How does Acme Corp's remote work policy affect employee productivity?",
+      "expected_answer_contains": ["cannot be determined", "not specified", "no information available"],
+      "expected_sources": [],
+      "question_type": "unanswerable",
+      "hop_count": 0
+    },
+    {
+      "id": "q30",
+      "question": "What are the eligibility requirements for remote work at Acme Corp?",
+      "expected_answer_contains": ["6-month introductory period", "performance ratings must meet or exceed expectations", "roles that require physical presence are not eligible"],
+      "expected_sources": ["hr_remote_work_policy.md"],
+      "question_type": "factual",
+      "hop_count": 1
+    }
+  ]
+}
