@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "installedAt": "2026-10-31T17:03:26.905Z",
+  "files": {
+    "C:\\projects\\RAG Demo project\\.claude\\settings.json": {
+      "plugins": [
+        "ruflo-mods@ruflo",
+        "ruflo-swarm@ruflo",
+        "ruflo-console@ruflo"
+      ],
+      "marketplace": true,
+      "env": true,
+      "claudeInstalled": []
+    }
+  }
+}
