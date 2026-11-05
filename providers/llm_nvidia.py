@@ -267,6 +267,7 @@ class NVIDIAProvider(LLMProvider):
             finish_reason=finish,
             raw=data,
         )
+        self.last_result = result  # exposed for usage/observability in callers
         logger.info(
             "nvidia chat ok model=%s latency_ms=%.1f tokens=%d",
             result.model, result.latency_ms, result.usage.total_tokens,

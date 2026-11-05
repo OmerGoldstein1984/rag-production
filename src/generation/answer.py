@@ -8,6 +8,8 @@ import re
 import time
 from dataclasses import dataclass, asdict
 
+from pydantic import BaseModel, Field
+
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -25,28 +27,32 @@ class GenerationResult:
 
 
 class AnswerGenerator:
-    """Generates answers using language models with retrieved context."""
+    """Generates answers using language models with retrieved context.
 
-    def __init__(self, model_name: str = "mock"):
+    Uses a real LLMProvider (e.g. NVIDIA NIM) when one is supplied; otherwise
+    falls back to the deterministic mock (tests / local dev only).
+    """
+
+    def __init__(self, model_name: str = "mock", llm_provider: Any = None):
         """
         Initialize the answer generator.
 
         Args:
-            model_name: Name of the language model to use
+            model_name: Name of the language model to use (recorded in metadata)
+            llm_provider: An LLMProvider instance (e.g. NVIDIAProvider). If None,
+                the mock generator is used (never in production).
         """
         self.model_name = model_name
-        self.model = None
-        self._load_model()
+        self.llm_provider = llm_provider
+        self.model = llm_provider  # kept for backward-compat attribute name
 
         # Token estimation constants (rough approximations)
         self.chars_per_token = 4.0  # Average for English text
 
     def _load_model(self):
-        """Load the language model."""
-        # In a real implementation, this would load an LLM
-        # For now, we'll use a mock generator
-        logger.info(f"Initialized answer generator with model: {self.model_name}")
-        self.model = None  # Mock model
+        """Kept for backward compatibility; provider is injected via __init__."""
+        logger.info(f"Initialized answer generator with model: {self.model_name} "
+                    f"(provider={'real' if self.llm_provider else 'mock'})")
 
     def _estimate_tokens(self, text: str) -> int:
         """Estimate token count from text."""
@@ -120,11 +126,13 @@ class AnswerGenerator:
         Returns:
             Generated answer string
         """
-        if self.model is None:
-            return self._mock_generate(prompt)
-
-        # In a real implementation, this would call the LLM
-        # For now, return a placeholder
+        if self.llm_provider is not None:
+            try:
+                return self.llm_provider.generate(prompt)
+            except Exception as e:
+                logger.error(f"LLM provider failed, returning insufficient-evidence fallback: {e}")
+                return ("I don't have enough information to answer this question based on the "
+                        "provided documents. (LLM provider error)")
         return self._mock_generate(prompt)
 
     def generate_answer_with_context(self,
@@ -162,6 +170,22 @@ class AnswerGenerator:
         answer = self.generate_answer(prompt)
         answer_latency = (time.time() - answer_start) * 1000
 
+        # Capture provider-reported usage when available (real providers only)
+        provider_info: Dict[str, Any] = {"provider": "mock", "model": self.model_name}
+        usage = None
+        if self.llm_provider is not None:
+            info = self.llm_provider.get_model_info()
+            provider_info = {"provider": info.get("provider", "unknown"),
+                             "model": info.get("model_name", self.model_name)}
+            last = getattr(self.llm_provider, "last_result", None)
+            if last is not None and getattr(last, "usage", None):
+                usage = {
+                    "prompt_tokens": last.usage.prompt_tokens,
+                    "completion_tokens": last.usage.completion_tokens,
+                    "total_tokens": last.usage.total_tokens,
+                    "source": "provider-reported",
+                }
+
         # Extract sources from context documents
         sources = []
         for doc in used_documents:
@@ -192,16 +216,19 @@ class AnswerGenerator:
             token_counts=token_stats,
             prompt_version="v2",
             metadata={
-                "model_used": self.model_name,
+                "model_used": provider_info["model"],
+                "provider": provider_info["provider"],
                 "num_context_docs": len(used_documents),
                 "context_length": len(context),
-                "answer_generation_latency_ms": answer_latency
+                "answer_generation_latency_ms": answer_latency,
+                **({"usage": usage} if usage else {}),
             }
         )
 
         logger.info(f"Generated answer in {total_latency:.2f}ms "
                    f"({token_stats.get('prompt_tokens', 0)} prompt + "
-                   f"{token_stats.get('estimated_tokens', 0)} context tokens)")
+                   f"{token_stats.get('estimated_tokens', 0)} context tokens) "
+                   f"provider={provider_info['provider']} model={provider_info['model']}")
 
         return result
 
@@ -274,7 +301,29 @@ class AnswerGenerator:
 
         return answer
 
-    # Convenience function
-def create_answer_generator(model_name: str = "mock") -> AnswerGenerator:
-    """Create an answer generator instance."""
-    return AnswerGenerator(model_name)
+
+class GroundedAnswer(BaseModel):
+    """Structured, validated answer schema returned by the LLM."""
+
+    answer: str = Field(min_length=1)
+    citations: List[str] = Field(default_factory=list)
+    insufficient_evidence: bool = False
+
+    model_config = {"extra": "ignore"}
+
+
+def create_answer_generator(model_name: str = "mock", llm_provider: Any = None) -> AnswerGenerator:
+    """Create an answer generator instance.
+
+    If llm_provider is None, the provider is resolved from the environment via
+    create_llm_provider_from_env() (NVIDIA in prod, mock only if explicitly set).
+    """
+    if llm_provider is None:
+        try:
+            from providers.llm import create_llm_provider_from_env
+            llm_provider = create_llm_provider_from_env()
+            model_name = llm_provider.get_model_info().get("model_name", model_name)
+        except Exception as e:
+            logger.warning(f"Falling back to mock answer generator: {e}")
+            llm_provider = None
+    return AnswerGenerator(model_name, llm_provider=llm_provider)

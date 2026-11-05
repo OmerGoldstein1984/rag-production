@@ -241,9 +241,13 @@ def initialize_rag_pipeline(data_directory: str = "data/raw",
         retriever = dense_retriever
 
     reranker = create_reranker() if use_reranker else None
-    answer_generator = create_answer_generator()
+    # Real provider from env (NVIDIA in prod; mock only if LLM_PROVIDER=mock)
+    from providers.llm import create_llm_provider_from_env
+    llm_provider = create_llm_provider_from_env()
+    answer_generator = create_answer_generator(llm_provider=llm_provider)
 
     rag_pipeline = {
+        "llm_provider": llm_provider,
         "vector_store": vector_store,
         "embedder": embedder,
         "retriever": retriever,
