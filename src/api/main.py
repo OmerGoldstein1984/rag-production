@@ -180,8 +180,31 @@ USER_ROLES = {
     "guest": {"access_level": 0, "can_ingest": False, "can_delete": False}
 }
 
+def verify_api_token(authorization: Optional[str] = Header(None)) -> None:
+    """If API_TOKEN is configured, require 'Authorization: Bearer <token>'.
+
+    Without a configured token (local dev) this is a no-op. The token is
+    compared in constant time and never logged.
+    """
+    import hmac
+    from src.config import get_settings
+
+    expected = get_settings().api_token
+    if not expected:
+        return  # dev mode: no token configured
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    provided = authorization[len("Bearer "):].strip()
+    if not hmac.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
 def verify_user_role(access_level: int = Header(0, alias="X-Access-Level")) -> dict:
-    """Verify user access level and return role information."""
+    """Verify user access level and return role information.
+
+    Note: the access level is only trustworthy when API_TOKEN auth is enabled
+    (see verify_api_token) — otherwise the header is client-controlled.
+    """
     # Find role based on access level
     role = "guest"
     for role_name, role_info in USER_ROLES.items():
@@ -195,6 +218,31 @@ def verify_user_role(access_level: int = Header(0, alias="X-Access-Level")) -> d
         "can_ingest": USER_ROLES[role]["can_ingest"],
         "can_delete": USER_ROLES[role]["can_delete"]
     }
+
+
+# Directories that ingestion is allowed to read from (resolved, absolute)
+_ALLOWED_INGEST_ROOTS = [
+    (Path(__file__).resolve().parent.parent.parent / "data").resolve(),
+    (Path(__file__).resolve().parent.parent.parent / "uploads").resolve(),
+]
+
+
+def resolve_safe_ingest_dir(requested: str) -> Path:
+    """Resolve a requested ingest directory and ensure it stays within allowed roots.
+
+    Blocks path traversal (e.g. '../../etc' or absolute paths outside the project).
+    """
+    candidate = (Path(__file__).resolve().parent.parent.parent / requested).resolve()
+    for root in _ALLOWED_INGEST_ROOTS:
+        try:
+            candidate.relative_to(root)
+            return candidate
+        except ValueError:
+            continue
+    raise HTTPException(
+        status_code=400,
+        detail="data_directory must be inside the project 'data/' or 'uploads/' directory",
+    )
 
 def initialize_rag_pipeline(data_directory: str = "data/raw",
                           chunk_strategy: str = "recursive",
@@ -334,6 +382,7 @@ async def ask_question(
     background_tasks: BackgroundTasks,
     client_request: Request,
     user_info: dict = Depends(verify_user_role),
+    _token: None = Depends(verify_api_token),
     x_forwarded_for: Optional[str] = Header(None),
     user_agent: Optional[str] = Header(None)
 ):
@@ -465,6 +514,7 @@ async def search_documents(
     request: SearchRequest,
     client_request: Request,
     user_info: dict = Depends(verify_user_role),
+    _token: None = Depends(verify_api_token),
     x_forwarded_for: Optional[str] = Header(None),
     user_agent: Optional[str] = Header(None)
 ):
@@ -530,10 +580,15 @@ async def search_documents(
 async def ingest_documents(
     request: IngestRequest,
     background_tasks: BackgroundTasks,
-    user_info: dict = Depends(verify_user_role)
+    user_info: dict = Depends(verify_user_role),
+    _token: None = Depends(verify_api_token),
 ):
     """
     Ingest new documents into the system.
+
+    Security: requires bearer token when API_TOKEN is set, admin role, and the
+    data_directory is confined to the project's data/ or uploads/ directory
+    (path-traversal guard).
 
     Args:
         request: Ingest request containing document source and processing parameters
@@ -552,6 +607,9 @@ async def ingest_documents(
             detail="Insufficient permissions for document ingestion"
         )
 
+    # Path traversal guard: only allow dirs under project data/ or uploads/
+    safe_dir = resolve_safe_ingest_dir(request.data_directory)
+
     start_time = time.time()
 
     try:
@@ -561,7 +619,7 @@ async def ingest_documents(
         if not request.use_existing_vector_store or rag_pipeline is None:
             # Initialize with new parameters
             initialize_rag_pipeline(
-                data_directory=request.data_directory,
+                data_directory=str(safe_dir),
                 chunk_strategy=request.chunk_strategy,
                 chunk_size=request.chunk_size,
                 chunk_overlap=request.chunk_overlap,
@@ -573,7 +631,7 @@ async def ingest_documents(
             rag_pipeline = rag_pipeline  # Already set by initialize_rag_pipeline
         else:
             # Add to existing vector store
-            raw_docs = load_documents_from_directory(request.data_directory)
+            raw_docs = load_documents_from_directory(str(safe_dir))
             cleaned_docs = clean_documents(raw_docs)
             chunked_docs = chunk_documents(
                 cleaned_docs,
@@ -605,7 +663,8 @@ async def ingest_documents(
 @app.delete("/documents/{source}")
 async def delete_documents(
     source: str,
-    user_info: dict = Depends(verify_user_role)
+    user_info: dict = Depends(verify_user_role),
+    _token: None = Depends(verify_api_token),
 ):
     """
     Delete documents by source.
@@ -648,7 +707,8 @@ async def delete_documents(
 @app.post("/feedback", response_model=FeedbackResponse)
 async def submit_feedback(
     request: FeedbackRequest,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    _token: None = Depends(verify_api_token),
 ):
     """
     Submit feedback for a previous query response.

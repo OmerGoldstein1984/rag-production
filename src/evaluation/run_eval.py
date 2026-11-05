@@ -29,6 +29,27 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def make_llm_judge():
+    """Build an LLM-as-judge function from the env-selected provider.
+
+    Returns a callable(prompt) -> str. With LLM_PROVIDER=mock this is the mock
+    (CI-safe, no key); with nvidia it is the real NVIDIA model. Judge limitations
+    are documented in learn/04-evaluation.md — it is not ground truth.
+    """
+    from providers.llm import create_llm_provider_from_env
+
+    provider = create_llm_provider_from_env()
+
+    def judge(prompt: str) -> str:
+        try:
+            return provider.generate(prompt)
+        except Exception as e:
+            logger.warning(f"judge provider error: {e}")
+            return "0"
+
+    return judge
+
+
 class RAGEvaluationPipeline:
     """Complete RAG pipeline for evaluation with configurable components."""
 
@@ -119,6 +140,9 @@ class RAGEvaluationPipeline:
         add_documents_to_store(self.vector_store, embedded_docs)
         logger.info(f"Indexed {len(embedded_docs)} document vectors")
 
+        # Keep the corpus for BM25 (hybrid retrieval) — initialized once here
+        self._corpus = embedded_docs
+
         # Initialize embedder (needed for retriever)
         from src.embedding.embedder import Embedder
         self.embedder = Embedder()
@@ -126,19 +150,21 @@ class RAGEvaluationPipeline:
         # Initialize retriever
         self.retriever = create_retriever(self.vector_store, self.embedder)
 
-        # Initialize hybrid retriever if needed
+        # Initialize BM25 over the full corpus when hybrid is enabled
         if self.use_hybrid:
-            self.sparse_retriever = None  # Will be initialized per query for efficiency
+            from src.retrieval.sparse_retriever import create_bm25_retriever
+            self.sparse_retriever = create_bm25_retriever()
+            self.sparse_retriever.add_documents(embedded_docs)
             logger.info(f"Hybrid retrieval enabled: use_rrf={self.use_rrf}, alpha={self.hybrid_alpha}")
 
         self.is_ready = True
 
     def _initialize_sparse_retriever(self, documents: List[Dict[str, Any]]) -> None:
-        """Initialize sparse retriever (BM25) with given documents."""
+        """Initialize sparse retriever (BM25) with the corpus if not yet done."""
         if self.sparse_retriever is None:
             from src.retrieval.sparse_retriever import create_bm25_retriever
             self.sparse_retriever = create_bm25_retriever()
-            self.sparse_retriever.add_documents(documents)
+            self.sparse_retriever.add_documents(documents or getattr(self, "_corpus", []))
             logger.debug("Initialized BM25 retriever")
 
     def evaluate_single_question(self,
@@ -177,10 +203,6 @@ class RAGEvaluationPipeline:
 
         # Rerank documents if enabled
         if self.use_reranker and retrieved_docs:
-            # Initialize sparse retriever if needed for hybrid
-            if self.use_hybrid:
-                self._initialize_sparse_retriever(retrieved_docs)
-
             reranked_results = self.reranker.rerank(
                 question,
                 list(zip(retrieved_docs, retrieval_scores)),
@@ -196,19 +218,10 @@ class RAGEvaluationPipeline:
         # Format context for generation
         context = format_context(final_docs)
 
-        # Create prompt with specified version
-        prompt_template = self.prompt_engineer.create_prompt(self.prompt_version)
-        formatted_prompt = prompt_template.format(
-            question=question,
-            context=context
-        )
-
-        # Generate answer (using the formatted prompt directly with answer generator)
-        # For simplicity, we'll use the standard method but note that in a full implementation
-        # we would pass the formatted prompt to the LLM
+        # Generate answer with the (real or mock) provider via the answer generator
         answer_result = self.answer_generator.generate_answer_with_context(
             question, final_docs)
-        generated_answer = answer_result["answer"]
+        generated_answer = answer_result.answer
 
         # Determine relevant document IDs based on expected terms
         relevant_doc_ids = set()
@@ -275,56 +288,48 @@ class RAGEvaluationPipeline:
         Returns:
             List of (document, score) tuples
         """
-        # Initialize sparse retriever if needed
+        from src.retrieval.retriever import reciprocal_rank_fusion
+
+        # Ensure BM25 is initialized over the corpus
         if self.sparse_retriever is None:
-            # We need to get all documents from the vector store to initialize BM25
-            # This is inefficient but necessary for proper BM25 initialization
-            # In a production system, we would maintain the document corpus separately
-            all_docs = []  # We would get this from our document storage
-            # For now, we'll skip BM25 initialization and rely on dense only
-            # This is a limitation of this evaluation setup
-            logger.warning("BM25 retriever not initialized - falling back to dense only")
-            return self.retriever.retrieve(query, k=k, current_version_only=True)
+            self._initialize_sparse_retriever(getattr(self, "_corpus", []))
+
+        search_k = max(k * 3, 10)  # Get extra for fusion to work well
+        dense_results = self.retriever.retrieve(
+            query, k=search_k, current_version_only=True
+        )
+
+        if self.sparse_retriever is None:
+            logger.warning("BM25 unavailable - dense only")
+            return dense_results[:k]
+
+        sparse_results = self.sparse_retriever.retrieve(query, k=search_k)
 
         if self.use_rrf:
-            # Use RRF hybrid retriever
-            search_k = max(k * 3, 10)  # Get extra for RRF to work well
-            dense_results = self.retriever.retrieve(
-                query, k=search_k, current_version_only=True
-            )
-
-            # Get sparse results (we would need to implement this properly)
-            # For now, we'll simulate by using dense results only
-            # In a full implementation, we would call self.sparse_retriever.retrieve
-            sparse_results = []  # Placeholder
-
-            # Apply RRF
-            if sparse_results:
-                fused_results = RetrievalMetrics.reciprocal_rank_fusion(
-                    [dense_results, sparse_results], k=60
-                )
-                return fused_results[:k]
-            else:
-                # Fallback to dense only if sparse not available
-                return dense_results[:k]
+            fused = reciprocal_rank_fusion([dense_results, sparse_results], k=60)
+            return fused[:k]
         else:
-            # Use weighted combination
-            search_k = max(k * 3, 10)  # Get extra for combination
-            dense_results = self.retriever.retrieve(
-                query, k=search_k, current_version_only=True
-            )
+            # Weighted score combination (min-max normalize each list to [0,1])
+            def norm(results):
+                if not results:
+                    return results
+                scores = [s for _, s in results]
+                lo, hi = min(scores), max(scores)
+                span = (hi - lo) or 1.0
+                return [(d, (s - lo) / span) for d, s in results]
 
-            # Get sparse results (placeholder - would use BM25 in full implementation)
-            sparse_results = []  # Placeholder
-
-            # Combine scores using weighted average
-            if sparse_results:
-                # In a full implementation, we would combine the scores properly
-                # For now, we'll just use dense results
-                return dense_results[:k]
-            else:
-                # Fallback to dense only
-                return dense_results[:k]
+            dense_n = norm(dense_results)
+            sparse_n = norm(sparse_results)
+            combined = {}
+            from src.retrieval.retriever import _doc_key
+            for doc, s in dense_n:
+                combined.setdefault(_doc_key(doc), [doc, 0.0, 0.0])[1] = s
+            for doc, s in sparse_n:
+                combined.setdefault(_doc_key(doc), [doc, 0.0, 0.0])[2] = s
+            a = self.hybrid_alpha
+            out = [(v[0], a * v[1] + (1 - a) * v[2]) for v in combined.values()]
+            out.sort(key=lambda x: x[1], reverse=True)
+            return out[:k]
 
     def evaluate_golden_set(self, golden_set_path: str) -> Dict[str, Any]:
         """
@@ -816,6 +821,8 @@ def main():
     parser.add_argument("--run-ablation", action="store_true", help="Run ablation study")
     parser.add_argument("--run-comparison", action="store_true", help="Run configuration comparison")
     parser.add_argument("--output-dir", default="evaluation", help="Output directory for multiple runs")
+    parser.add_argument("--no-judge", action="store_true",
+                        help="Disable LLM-as-judge (heuristic fallbacks only)")
 
     # Set defaults
     parser.set_defaults(use_hybrid=True, use_reranker=True, use_rrf=False)
@@ -904,7 +911,8 @@ def main():
         # Standard single evaluation
         logger.info("Running standard evaluation...")
 
-        # Initialize pipeline
+        # Initialize pipeline (real judge from env unless --no-judge)
+        judge_fn = None if args.no_judge else make_llm_judge()
         pipeline = RAGEvaluationPipeline(
             chunk_strategy=args.chunk_strategy,
             chunk_size=args.chunk_size,
@@ -913,7 +921,8 @@ def main():
             use_reranker=args.use_reranker,
             use_rrf=args.use_rrf,
             hybrid_alpha=args.hybrid_alpha,
-            prompt_version=args.prompt_version
+            prompt_version=args.prompt_version,
+            llm_judge_fn=judge_fn
         )
 
         # Ingest and index documents

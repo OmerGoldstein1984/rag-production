@@ -41,6 +41,8 @@ class Settings:
     smtp_use_tls: bool = True
     alert_email_to: str = ""
     key_warn_days: int = 14
+    # Optional API bearer token. If set, mutating endpoints require it.
+    api_token: str = ""
 
     @property
     def is_real_provider(self) -> bool:
@@ -91,4 +93,5 @@ def get_settings() -> Settings:
         smtp_use_tls=os.environ.get("SMTP_USE_TLS", "true").lower() == "true",
         alert_email_to=os.environ.get("ALERT_EMAIL_TO", ""),
         key_warn_days=int(os.environ.get("KEY_WARN_DAYS", "14")),
+        api_token=os.environ.get("API_TOKEN", ""),
     )
