@@ -133,6 +133,83 @@ class VectorStore:
         else:
             self._add_to_fallback(vectors, documents, ids)
 
+    def list_sources(self) -> List[Dict[str, Any]]:
+        """One summary row per source file: filename, source path, chunk count,
+        doc_version, is_current, content hash (if recorded)."""
+        if CHROMA_AVAILABLE and self.collection is not None:
+            try:
+                data = self.collection.get(include=["metadatas"])
+                metas = data.get("metadatas", [])
+            except Exception as e:
+                logger.error(f"list_sources failed on ChromaDB: {e}")
+                return self._fallback_list_sources()
+        else:
+            metas = [d.get("metadata", {}) for d in self._fallback_documents]
+
+        by_file: Dict[str, Dict[str, Any]] = {}
+        for m in metas:
+            if not m:
+                continue
+            fn = m.get("filename") or m.get("source", "?")
+            row = by_file.setdefault(fn, {
+                "filename": fn,
+                "source": m.get("source"),
+                "chunk_count": 0,
+                "doc_version": m.get("doc_version"),
+                "is_current": False,
+                "content_hash": m.get("content_hash"),
+                "department": m.get("department"),
+            })
+            row["chunk_count"] += 1
+            if m.get("is_current"):
+                row["is_current"] = True
+        return sorted(by_file.values(), key=lambda r: r["filename"])
+
+    def _fallback_list_sources(self) -> List[Dict[str, Any]]:
+        by_file: Dict[str, Dict[str, Any]] = {}
+        for d in self._fallback_documents:
+            m = d.get("metadata", {})
+            fn = m.get("filename") or m.get("source", "?")
+            row = by_file.setdefault(fn, {"filename": fn, "source": m.get("source"),
+                                           "chunk_count": 0, "doc_version": m.get("doc_version"),
+                                           "is_current": False, "content_hash": m.get("content_hash")})
+            row["chunk_count"] += 1
+            if m.get("is_current"):
+                row["is_current"] = True
+        return sorted(by_file.values(), key=lambda r: r["filename"])
+
+    def mark_source_current(self, filename: str, current: bool) -> int:
+        """Set is_current on every chunk of the given source file. Returns count updated."""
+        target = filename.replace("\\", "/").split("/")[-1]
+        if CHROMA_AVAILABLE and self.collection is not None:
+            try:
+                data = self.collection.get(include=["metadatas"])
+                ids, metas = data.get("ids", []), data.get("metadatas", [])
+                upd_ids, upd_metas = [], []
+                for doc_id, m in zip(ids, metas):
+                    if (m or {}).get("filename") == target or \
+                       str((m or {}).get("source", "")).replace("\\", "/").split("/")[-1] == target:
+                        new_meta = dict(m or {})
+                        new_meta["is_current"] = current
+                        upd_ids.append(doc_id)
+                        upd_metas.append(new_meta)
+                if upd_ids:
+                    self.collection.update(ids=upd_ids, metadatas=upd_metas)
+                return len(upd_ids)
+            except Exception as e:
+                logger.error(f"mark_source_current failed on ChromaDB: {e}")
+                return self._fallback_mark_current(target, current)
+        return self._fallback_mark_current(target, current)
+
+    def _fallback_mark_current(self, filename: str, current: bool) -> int:
+        n = 0
+        for d in self._fallback_documents:
+            m = d.get("metadata", {})
+            if m.get("filename") == filename:
+                m["is_current"] = current
+                n += 1
+        return n
+
     def _get_existing_ids(self) -> List[str]:
         """Return all currently stored document ids (ChromaDB or fallback)."""
         if CHROMA_AVAILABLE and self.collection is not None:

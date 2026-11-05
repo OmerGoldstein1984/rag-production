@@ -3,7 +3,7 @@ FastAPI application for the RAG system - Enhanced for production deployment.
 """
 
 from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, HTTPException, Depends, Header, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, Header, Request, BackgroundTasks, UploadFile, File
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 import logging
@@ -168,6 +168,8 @@ class RateLimiter:
 
 # Global RAG pipeline components
 rag_pipeline = None
+from src.ingestion.manager import DocumentManager  # noqa: E402
+doc_manager = DocumentManager()
 query_cache = QueryCache(max_size=200)
 rate_limiter = RateLimiter(max_requests=30, window_seconds=60)  # 30 requests per minute
 feedback_store = []  # In production, this would be a database
@@ -738,18 +740,83 @@ async def delete_documents(
     try:
         logger.info(f"Deleting documents from source: {source} for user: {user_info['role']}")
 
-        # Delete documents by source
-        deleted_count = rag_pipeline["vector_store"].delete_by_source(source)
-
-        return {
-            "message": f"Successfully deleted {deleted_count} documents from source '{source}'",
-            "source": source,
-            "deleted_count": deleted_count
-        }
+        # Delete vector-store chunks AND the file on disk (cascade)
+        result = doc_manager.delete(source, rag_pipeline["vector_store"])
+        result["message"] = f"Deleted {result['chunks_deleted']} chunks and file for '{source}'"
+        return result
 
     except Exception as e:
         logger.error(f"Error deleting documents: {e}")
         raise HTTPException(status_code=500, detail=f"Error deleting documents: {str(e)}")
+
+@app.post("/documents/upload")
+async def upload_document(
+    file: UploadFile = File(...),
+    user_info: dict = Depends(verify_user_role),
+    _token: None = Depends(verify_api_token),
+):
+    """Upload one document (pdf/docx/md/txt, size-capped). Validates, dedupes by
+    content hash, versions on filename collision, and indexes it immediately."""
+    if not user_info["can_ingest"]:
+        raise HTTPException(status_code=403, detail="Insufficient permissions to upload")
+    if rag_pipeline is None:
+        raise HTTPException(status_code=503, detail="RAG pipeline not initialized")
+
+    content = await file.read()
+    try:
+        rec = doc_manager.upload(file.filename or "unnamed", content, rag_pipeline["vector_store"])
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return rec.to_dict()
+
+
+@app.get("/documents")
+async def list_documents(
+    user_info: dict = Depends(verify_user_role),
+    _token: None = Depends(verify_api_token),
+):
+    """List all indexed source documents with chunk counts and version info."""
+    if rag_pipeline is None:
+        raise HTTPException(status_code=503, detail="RAG pipeline not initialized")
+    return {"documents": doc_manager.list_documents(rag_pipeline["vector_store"])}
+
+
+@app.get("/documents/status")
+async def ingest_status(
+    limit: int = 50,
+    _token: None = Depends(verify_api_token),
+):
+    """Recent ingestion operations (ok/duplicate/superseded/failed)."""
+    return {"records": doc_manager.status_log(limit)}
+
+
+@app.get("/documents/{source}/status")
+async def document_status(
+    source: str,
+    _token: None = Depends(verify_api_token),
+):
+    """Latest ingest status for one document."""
+    st = doc_manager.get_status(source)
+    if st is None:
+        raise HTTPException(status_code=404, detail="no ingest record for this document")
+    return st
+
+
+@app.post("/documents/reindex")
+async def reindex_documents(
+    data_dir: str = "data/raw",
+    user_info: dict = Depends(verify_user_role),
+    _token: None = Depends(verify_api_token),
+):
+    """Rebuild the vector store from uploads/ + data dir. Admin only."""
+    if not user_info["can_ingest"]:
+        raise HTTPException(status_code=403, detail="Insufficient permissions to reindex")
+    if rag_pipeline is None:
+        raise HTTPException(status_code=503, detail="RAG pipeline not initialized")
+    safe_dir = resolve_safe_ingest_dir(data_dir)
+    result = doc_manager.reindex(rag_pipeline["vector_store"], data_dir=str(safe_dir))
+    return result
+
 
 @app.post("/feedback", response_model=FeedbackResponse)
 async def submit_feedback(

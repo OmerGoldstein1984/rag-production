@@ -33,7 +33,8 @@ class DocumentLoader:
             "last_modified": datetime.datetime.fromtimestamp(stat.st_mtime).isoformat(),
             "department": self._infer_department(file_path),
             "access_level": "internal",  # Default access level
-            "doc_version": self._extract_version(file_path) or "1.0"
+            "doc_version": self._extract_version(file_path) or "1.0",
+            "is_current": True,  # version filter relies on this
         }
 
     def _infer_department(self, file_path: str) -> str:
