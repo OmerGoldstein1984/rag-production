@@ -1,21 +1,28 @@
-version: '3.8'
-
 services:
   # FastAPI Backend
   api:
     build: .
     ports:
       - "8000:8000"
+    env_file:
+      # optional: copy .env.example to .env and fill in. Secrets are never baked into the image.
+      - path: .env
+        required: false
     environment:
       - LOG_LEVEL=info
+      - LLM_PROVIDER=${LLM_PROVIDER:-mock}
     volumes:
+      # persistent vector store + embedding cache + uploaded docs
       - ./data:/app/data:rw
+      - ./uploads:/app/uploads:rw
       - ./logs:/app/logs:rw
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      # python-based: curl is not present in the slim image
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
       interval: 30s
-      timeout: 3s
+      timeout: 5s
+      start_period: 30s
       retries: 3
 
   # Streamlit UI

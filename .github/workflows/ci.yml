@@ -36,5 +36,16 @@ jobs:
           import providers.llm, providers.llm_nvidia, providers.embeddings
           import src.retrieval.hybrid, src.retrieval.retriever, src.retrieval.reranker
           import src.retrieval.sparse_retriever, src.retrieval.query_rewriter, src.retrieval.conversation_memory
+          import src.agent, src.observability, src.ingestion.manager
           print('all imports OK')
           "
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image (verifies Dockerfile + .dockerignore, no secrets baked in)
+        run: docker build -t rag-academy:ci .
+      - name: Verify no .env was baked into the image
+        run: |
+          docker run --rm --entrypoint sh rag-academy:ci -c "test ! -e /app/.env && echo 'no .env in image'"
