@@ -48,6 +48,9 @@ class QueryResponse(BaseModel):
     query: str
     latency_ms: float
     feedback_id: str
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    usage: Optional[Dict[str, Any]] = None
 
 class SearchRequest(BaseModel):
     query: str
@@ -537,7 +540,10 @@ async def ask_question(
             context_used=context_used,
             query=request.query,
             latency_ms=round(latency_ms, 2),
-            feedback_id=feedback_id
+            feedback_id=feedback_id,
+            provider=answer_result.metadata.get("provider"),
+            model=answer_result.metadata.get("model_used"),
+            usage=answer_result.metadata.get("usage"),
         )
 
         # Cache the result
@@ -557,6 +563,71 @@ async def ask_question(
     except Exception as e:
         logger.error(f"Error processing query: {e}")
         raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
+
+@app.post("/ask/stream")
+async def ask_stream(
+    request: QueryRequest,
+    client_request: Request,
+    user_info: dict = Depends(verify_user_role),
+    _token: None = Depends(verify_api_token),
+    x_forwarded_for: Optional[str] = Header(None),
+):
+    """Streaming RAG answer (SSE). Emits token events then a final done event
+    with sources/usage/provider. Retrieval + validation + tracing still apply."""
+    from fastapi.responses import StreamingResponse
+    from src.observability import get_request_id, metrics, Trace, record_trace
+
+    if rag_pipeline is None:
+        raise HTTPException(status_code=503, detail="RAG pipeline not initialized")
+    client_id = x_forwarded_for or (client_request.client.host if client_request.client else "unknown")
+    if not rate_limiter.is_allowed(client_id):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded.")
+
+    trace = Trace(request_id=get_request_id())
+    metrics.inc("ask_stream_total")
+
+    async def event_gen():
+        import json as _json
+        try:
+            with trace.stage("retrieve", k=request.top_k):
+                retrieved = rag_pipeline["retriever"].retrieve(
+                    request.query,
+                    k=request.top_k * 2 if request.use_reranker else request.top_k,
+                    current_version_only=request.current_version_only)
+            docs = [d for d, _ in retrieved]
+            scores = [s for _, s in retrieved]
+            if request.use_reranker and rag_pipeline["reranker"] is not None:
+                with trace.stage("rerank", k=request.top_k):
+                    reranked = rag_pipeline["reranker"].rerank(
+                        request.query, list(zip(docs, scores)), k=request.top_k)
+                final_docs = [d for d, _ in reranked]
+            else:
+                final_docs = docs[:request.top_k]
+
+            with trace.stage("llm"):
+                gen = rag_pipeline["answer_generator"].stream_answer_with_context(
+                    request.query, final_docs)
+                done = None
+                for event in gen:
+                    if event.get("type") == "done":
+                        done = event
+                    yield f"data: {_json.dumps(event, default=str)}\n\n"
+            record_trace(trace)
+            metrics.inc("ask_stream_done")
+            if done and done.get("usage"):
+                metrics.add_tokens(done["usage"].get("prompt_tokens", 0),
+                                   done["usage"].get("completion_tokens", 0))
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            metrics.inc_error(type(e).__name__)
+            trace.error = str(e)
+            record_trace(trace)
+            yield f"data: {_json.dumps({'type': 'error', 'error': str(e)[:300]})}\n\n"
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream",
+                             headers={"X-Request-Id": get_request_id()})
+
 
 @app.post("/search", response_model=SearchResponse)
 async def search_documents(

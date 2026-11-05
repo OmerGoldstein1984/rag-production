@@ -73,6 +73,12 @@ class MockLLMProvider(LLMProvider):
         else:
             return "This is a mock response from the LLM provider."
 
+    def stream_chat(self, messages, **kwargs):
+        """Mock streaming: yields the full mock answer in small chunks."""
+        text = self.generate(messages[-1].get("content", "") if messages else "")
+        for i in range(0, len(text), 24):
+            yield text[i:i + 24]
+
     def get_model_info(self) -> Dict[str, Any]:
         """Get information about the mock model."""
         return {
@@ -80,7 +86,7 @@ class MockLLMProvider(LLMProvider):
             "model_name": self.model_name,
             "type": "mock",
             "max_tokens": 1000,
-            "supports_streaming": False
+            "supports_streaming": True
         }
 
 # Placeholder for real LLM providers (would be implemented based on actual APIs)

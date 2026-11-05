@@ -232,6 +232,64 @@ class AnswerGenerator:
 
         return result
 
+    def stream_answer_with_context(self,
+                                   query: str,
+                                   context_documents: List[Dict[str, Any]],
+                                   max_context_tokens: int = 2000):
+        """Streaming RAG answer. Yields dict events:
+        {"type":"token","text":...} ... then a final
+        {"type":"done","sources":...,"usage":...,"latency_ms":...,"provider":...,"model":...}.
+        Falls back to one-shot if the provider can't stream.
+        """
+        import json as _json
+        context, used_documents, token_stats = self._build_context_within_budget(
+            context_documents, max_context_tokens)
+        from .prompt import create_grounded_prompt
+        prompt = create_grounded_prompt(context, query, "v2")
+        prompt_tokens = self._estimate_tokens(prompt)
+        token_stats["prompt_tokens"] = prompt_tokens
+
+        provider_info = {"provider": "mock", "model": self.model_name}
+        streamer = getattr(self.llm_provider, "stream_chat", None) if self.llm_provider else None
+
+        answer_start = time.time()
+        if streamer is not None:
+            full = []
+            for chunk in streamer([{"role": "user", "content": prompt}]):
+                full.append(chunk)
+                yield {"type": "token", "text": chunk}
+            answer = "".join(full)
+        else:
+            answer = self.generate_answer(prompt)
+            yield {"type": "token", "text": answer}
+        latency_ms = (time.time() - answer_start) * 1000
+
+        if self.llm_provider is not None:
+            info = self.llm_provider.get_model_info()
+            provider_info = {"provider": info.get("provider", "unknown"),
+                             "model": info.get("model_name", self.model_name)}
+
+        sources = []
+        for doc in used_documents:
+            md = doc.get("metadata", {})
+            src = md.get("source", "Unknown")
+            fn = src.replace("\\", "/").split("/")[-1] if src else "Unknown"
+            sources.append({"source": src, "source_filename": fn,
+                            "chunk_index": md.get("chunk_index"),
+                            "content_snippet": (doc.get("content", "")[:200] + "...")
+                            if len(doc.get("content", "")) > 200 else doc.get("content", "")})
+
+        usage = token_stats
+        last = getattr(self.llm_provider, "last_result", None) if self.llm_provider else None
+        if last is not None and getattr(last, "usage", None):
+            usage = {"prompt_tokens": last.usage.prompt_tokens,
+                     "completion_tokens": last.usage.completion_tokens,
+                     "total_tokens": last.usage.total_tokens,
+                     "source": "provider-reported"}
+
+        yield {"type": "done", "answer": answer, "sources": sources, "usage": usage,
+               "latency_ms": round(latency_ms, 2), **provider_info}
+
     def generate_multiple_answers(self,
                                  queries: List[str],
                                  contexts_list: List[List[Dict[str, Any]]],
