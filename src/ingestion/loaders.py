@@ -122,24 +122,48 @@ class MarkdownLoader(DocumentLoader):
 
 
 class PDFLoader(DocumentLoader):
-    """Loader for PDF files."""
+    """Loader for PDF files. Tries pypdf, then PyPDF2; never fabricates text."""
 
     def load(self, file_path: str) -> Dict[str, Any]:
-        # Placeholder - in real implementation would use PyPDF2 or similar
-        # For now, we'll simulate reading a PDF
-        try:
-            # Try to read as text first (if it's actually a text file with .pdf extension)
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-        except UnicodeDecodeError:
-            # If it's a real PDF, we'd extract text here
-            # For demo purposes, we'll create some sample content
-            content = f"[PDF content from {file_path}]\n\nThis represents extracted text from a PDF document. In a real implementation, we would use PyPDF2 or pdfplumber to extract the actual text content from the PDF file."
+        content = ""
+        pages = 0
+        errors: List[str] = []
+        reader_cls = None
+        for mod_name in ("pypdf", "PyPDF2"):
+            try:
+                mod = __import__(mod_name)
+                reader_cls = mod.PdfReader
+                break
+            except ImportError:
+                continue
+        if reader_cls is None:
+            errors.append("no PDF library installed (pip install pypdf)")
+        else:
+            try:
+                with open(file_path, "rb") as fh:
+                    reader = reader_cls(fh)
+                    pages = len(reader.pages)
+                    parts = []
+                    for i, page in enumerate(reader.pages):
+                        try:
+                            parts.append(page.extract_text() or "")
+                        except Exception as e:
+                            errors.append(f"page {i + 1}: {e}")
+                    content = "\n\n".join(parts).strip()
+            except Exception as e:
+                errors.append(f"pdf parse error: {e}")
+
+        if not content:
+            # Do NOT fabricate content — record that extraction failed.
+            content = ""
+            errors.append("no text extracted")
 
         metadata = self._extract_basic_metadata(file_path)
         metadata.update({
             "type": "pdf",
-            "estimated_pages": max(1, len(content) // 500)  # Rough estimate
+            "pages": pages,
+            "extraction_errors": errors,
+            "extracted_ok": bool(content),
         })
 
         return {
@@ -149,28 +173,67 @@ class PDFLoader(DocumentLoader):
 
 
 class DocxLoader(DocumentLoader):
-    """Loader for DOCX files."""
+    """Loader for DOCX files. Uses python-docx if available, else stdlib zipfile+XML.
+
+    DOCX is a zip containing word/document.xml — the stdlib fallback needs no deps.
+    Never fabricates text.
+    """
 
     def load(self, file_path: str) -> Dict[str, Any]:
-        # Placeholder - in real implementation would use python-docx
+        content = ""
+        errors: List[str] = []
         try:
-            # Try to read as text first
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-        except UnicodeDecodeError:
-            # If it's a real DOCX, we'd extract text here
-            # For demo purposes, we'll create some sample content
-            content = f"[DOCX content from {file_path}]\n\nThis represents extracted text from a Word document. In a real implementation, we would use python-docx to extract the actual text content from the DOCX file."
+            import docx  # type: ignore
+
+            document = docx.Document(file_path)
+            parts = [p.text for p in document.paragraphs if p.text.strip()]
+            for table in document.tables:
+                for row in table.rows:
+                    cells = [c.text.strip() for c in row.cells]
+                    if any(cells):
+                        parts.append(" | ".join(cells))
+            content = "\n\n".join(parts).strip()
+        except ImportError:
+            try:
+                content = self._extract_docx_stdlib(file_path)
+            except Exception as e:
+                errors.append(f"docx stdlib parse error: {e}")
+        except Exception as e:
+            errors.append(f"docx parse error: {e}")
+
+        if not content:
+            content = ""
+            errors.append("no text extracted")
 
         metadata = self._extract_basic_metadata(file_path)
         metadata.update({
-            "type": "docx"
+            "type": "docx",
+            "extraction_errors": errors,
+            "extracted_ok": bool(content),
         })
 
         return {
             "content": content,
             "metadata": metadata
         }
+
+    @staticmethod
+    def _extract_docx_stdlib(file_path: str) -> str:
+        """Extract paragraph text from word/document.xml using only the stdlib."""
+        import zipfile
+        import xml.etree.ElementTree as ET
+
+        W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+        with zipfile.ZipFile(file_path) as z:
+            xml = z.read("word/document.xml")
+        root = ET.fromstring(xml)
+        parts = []
+        for p in root.iter(W + "p"):
+            texts = [t.text or "" for t in p.iter(W + "t")]
+            line = "".join(texts).strip()
+            if line:
+                parts.append(line)
+        return "\n\n".join(parts).strip()
 
 
 def get_loader_for_file(file_path: str) -> DocumentLoader:
