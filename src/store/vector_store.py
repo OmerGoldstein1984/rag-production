@@ -61,11 +61,11 @@ class VectorStore:
                 )
             )
 
-            # Get or create collection
+            # Get or create collection (chromadb raises NotFoundError, not ValueError, when absent)
             try:
                 self.collection = self.client.get_collection(name=self.collection_name)
                 logger.info(f"Loaded existing collection: {self.collection_name}")
-            except ValueError:
+            except Exception:
                 # Collection doesn't exist, create it
                 self.collection = self.client.create_collection(
                     name=self.collection_name,
@@ -103,6 +103,11 @@ class VectorStore:
 
         if ids is None:
             ids = [f"doc_{len(self._get_existing_ids()) + i}" for i in range(len(documents))]
+        # ensure generated ids don't collide with existing ones
+        existing = set(self._get_existing_ids())
+        if existing.intersection(ids):
+            import uuid
+            ids = [f"doc_{uuid.uuid4().hex[:12]}" for _ in documents]
         elif len(ids) != len(documents):
             raise ValueError("Number of IDs must match number of documents")
 
@@ -127,6 +132,16 @@ class VectorStore:
                 self._add_to_fallback(vectors, documents, ids)
         else:
             self._add_to_fallback(vectors, documents, ids)
+
+    def _get_existing_ids(self) -> List[str]:
+        """Return all currently stored document ids (ChromaDB or fallback)."""
+        if CHROMA_AVAILABLE and self.collection is not None:
+            try:
+                return self.collection.get(include=[]).get("ids", [])
+            except Exception as e:
+                logger.error(f"Failed to list ChromaDB ids: {e}")
+                return list(self._fallback_ids)
+        return list(self._fallback_ids)
 
     def _add_to_fallback(self,
                         vectors: List[List[float]],
@@ -291,6 +306,51 @@ class VectorStore:
             return self._fallback_documents[idx]
         except ValueError:
             return None
+
+    def delete_by_source(self, source: str) -> int:
+        """
+        Delete all chunks belonging to a source file.
+
+        Args:
+            source: Source identifier (path or filename) to match against metadata['source']
+
+        Returns:
+            Number of documents deleted
+        """
+        # Match by exact source path OR by basename (API may pass either)
+        target_name = source.replace("\\", "/").split("/")[-1]
+        if CHROMA_AVAILABLE and self.collection is not None:
+            try:
+                # Chroma where-clauses support $eq / $contains-like ops only on exact fields,
+                # so fetch candidate ids by querying metadata, then delete.
+                all_meta = self.collection.get(include=["metadatas"])
+                ids_to_delete = [
+                    doc_id
+                    for doc_id, meta in zip(all_meta.get("ids", []), all_meta.get("metadatas", []))
+                    if (meta or {}).get("source") == source
+                    or str((meta or {}).get("filename", "")) == target_name
+                ]
+                if ids_to_delete:
+                    self.collection.delete(ids=ids_to_delete)
+                logger.info(f"Deleted {len(ids_to_delete)} chunks for source {source!r} from ChromaDB")
+                return len(ids_to_delete)
+            except Exception as e:
+                logger.error(f"Failed to delete by source from ChromaDB: {e}")
+                return self._fallback_delete_by_source(source)
+        return self._fallback_delete_by_source(source)
+
+    def _fallback_delete_by_source(self, source: str) -> int:
+        target_name = source.replace("\\", "/").split("/")[-1]
+        keep = [
+            i for i, doc in enumerate(self._fallback_documents)
+            if (doc.get("metadata", {}).get("source") != source
+                and doc.get("metadata", {}).get("filename") != target_name)
+        ]
+        deleted = len(self._fallback_documents) - len(keep)
+        self._fallback_vectors = [self._fallback_vectors[i] for i in keep]
+        self._fallback_documents = [self._fallback_documents[i] for i in keep]
+        self._fallback_ids = [self._fallback_ids[i] for i in keep]
+        return deleted
 
     def delete_by_id(self, doc_id: str) -> bool:
         """

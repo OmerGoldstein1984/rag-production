@@ -5,3 +5,17 @@
 .claude-flow/data/
 .claude-flow/logs/
 .claude-flow/sessions/
+
+# Local key-expiry registry (contains key fingerprints + dates — keep local)
+data/key_registry.json
+# Runtime data
+logs/
+data/chroma_db/
+data/embedding_cache/
+reports/
+evaluation/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/

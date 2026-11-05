@@ -133,12 +133,41 @@ def create_llm_provider(provider_type: str = "mock", **kwargs) -> LLMProvider:
     Factory function to create LLM providers.
 
     Args:
-        provider_type: Type of provider to create ("mock", "openai", "anthropic")
+        provider_type: Type of provider to create ("mock", "nvidia", "openai", "anthropic")
         **kwargs: Additional arguments for provider initialization
 
     Returns:
         LLMProvider instance
+
+    "nvidia" is the production provider (NVIDIA NIM, OpenAI-compatible).
+    "mock" is for local development and tests only — never use it in prod.
     """
+    if provider_type.lower() == "nvidia":
+        from .llm_nvidia import NVIDIAProvider  # lazy import: httpx only needed for real calls
+        from src.config import get_settings
+        from src.key_pool import KeyPool
+
+        settings = get_settings()
+        # Prefer the multi-key pool (NVIDIA_API_KEYS); fall back to the single key.
+        if settings.nvidia_api_keys:
+            pool = KeyPool(keys=list(settings.nvidia_api_keys))
+            return NVIDIAProvider(
+                model=settings.nvidia_model,
+                base_url=settings.nvidia_base_url,
+                timeout_s=settings.nvidia_timeout_s,
+                max_retries=settings.nvidia_max_retries,
+                key_pool=pool,
+                **kwargs,
+            )
+        return NVIDIAProvider(
+            api_key=settings.nvidia_api_key or "",
+            model=settings.nvidia_model,
+            base_url=settings.nvidia_base_url,
+            timeout_s=settings.nvidia_timeout_s,
+            max_retries=settings.nvidia_max_retries,
+            **kwargs,
+        )
+
     providers = {
         "mock": MockLLMProvider,
         "openai": OpenAILLMProvider,
@@ -150,3 +179,13 @@ def create_llm_provider(provider_type: str = "mock", **kwargs) -> LLMProvider:
         raise ValueError(f"Unsupported provider type: {provider_type}")
 
     return provider_class(**kwargs)
+
+
+def create_llm_provider_from_env() -> LLMProvider:
+    """Create the provider selected by the LLM_PROVIDER env var (default: mock).
+
+    Fails fast with a clear error if provider=nvidia and NVIDIA_API_KEY is missing.
+    """
+    from src.config import get_settings
+
+    return create_llm_provider(get_settings().llm_provider)

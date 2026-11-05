@@ -24,7 +24,8 @@ class Retriever:
 
     def retrieve(self, query: str, k: int = 5,
                 metadata_filters: Optional[Dict[str, Any]] = None,
-                similarity_threshold: float = 0.0) -> List[Tuple[Dict[str, Any], float]]:
+                similarity_threshold: float = 0.0,
+                current_version_only: bool = False) -> List[Tuple[Dict[str, Any], float]]:
         """
         Retrieve k most relevant documents for a query with optional filtering.
 
@@ -33,12 +34,17 @@ class Retriever:
             k: Number of documents to retrieve
             metadata_filters: Dictionary of metadata key-value pairs to filter by
             similarity_threshold: Minimum similarity score threshold (0-1)
+            current_version_only: If True, exclude chunks whose metadata marks them
+                as non-current (``is_current == False``)
 
         Returns:
             List of tuples (document, similarity_score) that meet filters and threshold
         """
         # Embed the query
         query_embedding = self.embedder.embed_text(query)
+
+        if current_version_only and metadata_filters is None:
+            metadata_filters = {"is_current": True}
 
         # Search the vector store with metadata filters
         results = self.vector_store.search(
@@ -75,11 +81,9 @@ class Retriever:
             List of tuples (document, similarity_score)
         """
         if current_version_only:
-            # Filter to get only current versions
-            # This assumes we have a way to identify current versions
-            # For demo, we'll filter out documents marked as obsolete or old versions
-            metadata_filters = {"doc_version": "2.1"}  # Current version in our sample data
-            return self.retrieve(query, k, metadata_filters, similarity_threshold)
+            # Keep only chunks explicitly marked as the current version.
+            # (Old versions carry is_current=False in metadata.)
+            return self.retrieve(query, k, {"is_current": True}, similarity_threshold)
         else:
             return self.retrieve(query, k, similarity_threshold=similarity_threshold)
 
@@ -196,6 +200,23 @@ class HybridRetriever:
         return combined_results[:k]
 
 
+def _doc_key(doc: Dict[str, Any]) -> str:
+    """Stable identity for a retrieved chunk, independent of object identity.
+
+    Different retrievers (dense vs BM25) return distinct dict objects for the
+    same underlying chunk, so id() never matches across lists. Prefer an
+    explicit doc_id, then source+chunk_index, then a content hash.
+    """
+    meta = doc.get("metadata", {}) if isinstance(doc, dict) else {}
+    if meta.get("doc_id"):
+        return str(meta["doc_id"])
+    if meta.get("source") and meta.get("chunk_index") is not None:
+        return f"{meta['source']}#{meta['chunk_index']}"
+    content = doc.get("content", "") if isinstance(doc, dict) else repr(doc)
+    import hashlib
+    return "h:" + hashlib.md5(content.encode("utf-8")).hexdigest()
+
+
 def reciprocal_rank_fusion(rank_lists: List[List[Tuple[Dict[str, Any], float]]],
                           k: int = 60) -> List[Tuple[Dict[str, Any], float]]:
     """
@@ -203,39 +224,26 @@ def reciprocal_rank_fusion(rank_lists: List[List[Tuple[Dict[str, Any], float]]],
 
     Args:
         rank_lists: List of ranked document lists (each element is (doc, score))
-        k: RFF parameter (default 60)
+        k: RRF parameter (default 60)
 
     Returns:
         Fused ranked list of documents (doc, score)
     """
-    doc_scores = {}
+    doc_scores: Dict[str, float] = {}
+    doc_map: Dict[str, Dict[str, Any]] = {}
 
     for rank_list in rank_lists:
         for rank, (doc, _) in enumerate(rank_list):
-            doc_id = id(doc)
-            if doc_id not in doc_scores:
-                doc_scores[doc_id] = 0.0
-            doc_scores[doc_id] += 1.0 / (k + rank + 1)
+            key = _doc_key(doc)
+            if key not in doc_scores:
+                doc_scores[key] = 0.0
+                doc_map[key] = doc
+            doc_scores[key] += 1.0 / (k + rank + 1)
 
     # Sort by score descending
     sorted_docs = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)
 
-    # Return documents in order with their fused scores
-    result = []
-    for doc_id, score in sorted_docs:
-        # We need to recover the actual document objects and their original scores
-        # This is a limitation of using id() - in practice we'd store proper doc IDs
-        # For this implementation, we'll search through the original lists
-        for rank_list in rank_lists:
-            for doc, original_score in rank_list:
-                if id(doc) == doc_id:
-                    result.append((doc, score))
-                    break
-            else:
-                continue
-            break
-
-    return result
+    return [(doc_map[key], score) for key, score in sorted_docs]
 
 
 # Convenience function

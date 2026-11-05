@@ -122,8 +122,8 @@ def test_precision_at_k():
     precision = RetrievalMetrics.precision_at_k(retrieved_docs, relevant_doc_ids, k=3)
     assert precision == 2/3  # 2 out of 3 are relevant
 
-    # Test case 3: Zero precision
-    precision = RetrievalMetrics.precision_at_k(retrieved_docs, {"doc3", "doc4"}, k=3)
+    # Test case 3: Zero precision (none of the retrieved docs are relevant)
+    precision = RetrievalMetrics.precision_at_k(retrieved_docs, {"doc4", "doc5"}, k=3)
     assert precision == 0.0  # 0 out of 3 are relevant
 
     # Test case 4: K larger than retrieved list
@@ -170,19 +170,18 @@ def test_average_precision():
     # Average: (1.0 + 1.0) / 2 = 1.0
     assert ap == 1.0
 
-    # Test case 2: Partial precision
+    # Test case 2: Partial precision (two relevant docs at ranks 2 and 4)
     retrieved_docs = [
-        {"metadata": {"doc_id": "doc2"}},  # Not relevant
+        {"metadata": {"doc_id": "doc9"}},  # Not relevant
         {"metadata": {"doc_id": "doc1"}},  # Relevant
-        {"metadata": {"doc_id": "doc3"}},  # Not relevant
-        {"metadata": {"doc_id": "doc2"}},  # Relevant (duplicate ID, but we'll treat as separate)
+        {"metadata": {"doc_id": "doc8"}},  # Not relevant
+        {"metadata": {"doc_id": "doc2"}},  # Relevant
     ]
     relevant_doc_ids = {"doc1", "doc2"}
 
     ap = RetrievalMetrics.average_precision(retrieved_docs, relevant_doc_ids)
-    # Precision at 2: 1/2 = 0.5 (first relevant at position 2)
-    # Precision at 4: 2/4 = 0.5 (second relevant at position 4)
-    # Average: (0.5 + 0.5) / 2 = 0.5
+    # Precision at rank 2: 1/2 = 0.5; at rank 4: 2/4 = 0.5
+    # AP = (0.5 + 0.5) / 2 = 0.5
     assert ap == 0.5
 
     # Test case 3: No relevant docs

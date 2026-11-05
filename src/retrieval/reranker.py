@@ -5,9 +5,13 @@ Document reranking utilities for improving retrieval quality.
 from typing import List, Dict, Any, Tuple, Optional
 import logging
 import numpy as np
-from sentence_transformers import CrossEncoder
 
 logger = logging.getLogger(__name__)
+
+try:
+    from sentence_transformers import CrossEncoder
+except ImportError:  # sentence-transformers optional at import time; reranker degrades to passthrough
+    CrossEncoder = None
 
 class Reranker:
     """Reranker using cross-encoder models for improved relevance scoring."""
@@ -24,13 +28,14 @@ class Reranker:
         self._load_model()
 
     def _load_model(self):
-        """Load the cross-encoder model."""
+        """Load the cross-encoder model (optional dependency; degrades to passthrough)."""
+        if CrossEncoder is None:
+            logger.warning("sentence-transformers not installed; reranker disabled (passthrough scores).")
+            self.model = None
+            return
         try:
             self.model = CrossEncoder(self.model_name)
             logger.info(f"Loaded reranker model: {self.model_name}")
-        except ImportError:
-            logger.warning("sentence-transformers not available for reranking. Using mock reranker.")
-            self.model = None
         except Exception as e:
             logger.error(f"Failed to load reranker model: {e}")
             self.model = None

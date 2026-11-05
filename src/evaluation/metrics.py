@@ -214,14 +214,19 @@ class RetrievalMetrics:
         if not relevant_doc_ids:
             return 0.0
 
-        # Calculate precision at each relevant document
+        # Calculate precision at each relevant document (dedupe by doc_id:
+        # the same chunk must not be counted twice if retrieved twice)
         precisions = []
         relevant_count = 0
+        seen = set()
 
         for i, doc in enumerate(retrieved_docs):
             doc_id = doc.get("metadata", {}).get("doc_id")
             if not doc_id:
                 doc_id = id(doc)
+            if doc_id in seen:
+                continue
+            seen.add(doc_id)
 
             if doc_id in relevant_doc_ids:
                 relevant_count += 1

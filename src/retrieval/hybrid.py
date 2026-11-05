@@ -8,6 +8,7 @@ import numpy as np
 
 from .sparse_retriever import BM25Retriever
 from .reranker import Reranker
+from .retriever import _doc_key
 
 logger = logging.getLogger(__name__)
 
@@ -87,28 +88,24 @@ class HybridRetrieverRRF:
             Fused ranked list of documents (doc, score)
         """
         doc_scores = {}
-        doc_map = {}  # Map doc_id back to document object
+        doc_map = {}  # Map stable doc key back to document object
 
         for rank_list in rank_lists:
             for rank, (doc, _) in enumerate(rank_list):
-                # Create a stable ID for the document based on its content
-                # In a real system, you'd use a proper document ID
-                doc_id = id(doc)  # Using object ID for simplicity
-                if doc_id not in doc_scores:
-                    doc_scores[doc_id] = 0.0
-                    doc_map[doc_id] = doc
+                # Stable key (doc_id / source#chunk / content hash) so the same
+                # chunk returned by dense AND sparse lists is fused correctly.
+                key = _doc_key(doc)
+                if key not in doc_scores:
+                    doc_scores[key] = 0.0
+                    doc_map[key] = doc
                 # RRF formula: 1 / (k + rank)
-                doc_scores[doc_id] += 1.0 / (self.k + rank + 1)
+                doc_scores[key] += 1.0 / (self.k + rank + 1)
 
         # Sort by score descending
         sorted_docs = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)
 
         # Return documents in order with their fused scores
-        result = []
-        for doc_id, score in sorted_docs:
-            result.append((doc_map[doc_id], score))
-
-        return result
+        return [(doc_map[key], score) for key, score in sorted_docs]
 
 
 def create_hybrid_retriever_rrf(dense_retriever: Any, sparse_retriever: BM25Retriever,

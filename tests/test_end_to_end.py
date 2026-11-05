@@ -20,6 +20,7 @@ from src.embedding.embedder import embed_documents
 from src.store.vector_store import create_vector_store, add_documents_to_store
 from src.retrieval.retriever import create_retriever
 from src.retrieval.reranker import create_reranker
+from src.embedding.embedder import Embedder
 from src.generation.answer import create_answer_generator
 
 def test_end_to_end_rag_pipeline():
@@ -71,8 +72,8 @@ def test_end_to_end_rag_pipeline():
             stats = vector_store.get_stats()
             assert stats.get("total_documents", 0) > 0, "Should have stored documents"
 
-            # Step 6: Create retriever and reranker
-            retriever = create_retriever(vector_store, None)  # None for embedder in test
+            # Step 6: Create retriever and reranker (real embedder; falls back to mock if ST missing)
+            retriever = create_retriever(vector_store, Embedder())
             reranker = create_reranker()
             answer_generator = create_answer_generator()
 
@@ -105,12 +106,12 @@ def test_end_to_end_rag_pipeline():
                 query, final_docs
             )
 
-            assert "answer" in answer_result, "Should generate an answer"
-            assert isinstance(answer_result["answer"], str), "Answer should be a string"
-            assert len(answer_result["answer"]) > 0, "Answer should not be empty"
+            assert hasattr(answer_result, "answer"), "Should generate an answer"
+            assert isinstance(answer_result.answer, str), "Answer should be a string"
+            assert len(answer_result.answer) > 0, "Answer should not be empty"
 
             # Verify answer contains relevant information
-            answer_lower = answer_result["answer"].lower()
+            answer_lower = answer_result.answer.lower()
             # Should mention something about remote work policy
             assert any(term in answer_lower for term in ["remote", "work", "policy", "days"]), \
                 "Answer should contain relevant terms"
@@ -148,7 +149,7 @@ def test_end_to_end_with_known_question():
         vector_store = create_vector_store()
         add_documents_to_store(vector_store, embedded_docs)
 
-        retriever = create_retriever(vector_store, None)
+        retriever = create_retriever(vector_store, Embedder())
         answer_generator = create_answer_generator()
 
         # Test a known question from the golden set
@@ -161,16 +162,15 @@ def test_end_to_end_with_known_question():
         final_docs = [doc for doc, _ in retrieved_docs_with_scores[:3]]
         answer_result = answer_generator.generate_answer_with_context(query, final_docs)
 
-        assert "answer" in answer_result
-        assert len(answer_result["answer"]) > 0
+        assert len(answer_result.answer) > 0
 
         # The answer should contain expected terms from the golden set
-        answer_lower = answer_result["answer"].lower()
+        answer_lower = answer_result.answer.lower()
         expected_terms = ["remote work", "eligible employees", "3 days per week", "manager approval"]
 
         # At least some of the expected terms should be present
         found_terms = [term for term in expected_terms if term in answer_lower]
-        assert len(found_terms) > 0, f"Should find at least some expected terms. Answer: {answer_result['answer']}"
+        assert len(found_terms) > 0, f"Should find at least some expected terms. Answer: {answer_result.answer}"
 
     except Exception as e:
         pytest.fail(f"End-to-end test with known question failed: {str(e)}")

@@ -208,6 +208,9 @@ def initialize_rag_pipeline(data_directory: str = "data/raw",
 
     logger.info("Initializing RAG pipeline for API...")
 
+    from src.embedding.embedder import Embedder
+    from src.retrieval.sparse_retriever import create_bm25_retriever
+
     # Load and process documents
     raw_docs = load_documents_from_directory(data_directory)
     cleaned_docs = clean_documents(raw_docs)
@@ -223,22 +226,29 @@ def initialize_rag_pipeline(data_directory: str = "data/raw",
     vector_store = create_vector_store()
     add_documents_to_store(vector_store, embedded_docs)
 
-    # Create retriever based on configuration
+    # Embedder is required to embed queries at retrieval time
+    embedder = Embedder()
+    dense_retriever = create_retriever(vector_store, embedder)
+
+    # Sparse (BM25) retriever over the same chunks for hybrid search
+    sparse_retriever = create_bm25_retriever()
+    sparse_retriever.add_documents(embedded_docs)
+
+    # Single retriever facade: hybrid RRF when enabled, else dense-only
     if use_hybrid:
-        retriever = create_hybrid_retriever_rrf(
-            vector_store,
-            None,  # Embedder would be passed here in full implementation
-            use_rrf=use_rrf
-        )
+        retriever = create_hybrid_retriever_rrf(dense_retriever, sparse_retriever)
     else:
-        retriever = create_retriever(vector_store, None)
+        retriever = dense_retriever
 
     reranker = create_reranker() if use_reranker else None
     answer_generator = create_answer_generator()
 
     rag_pipeline = {
         "vector_store": vector_store,
+        "embedder": embedder,
         "retriever": retriever,
+        "dense_retriever": dense_retriever,
+        "sparse_retriever": sparse_retriever,
         "reranker": reranker,
         "answer_generator": answer_generator,
         "config": {
@@ -356,9 +366,8 @@ async def ask_question(
     cached_result = query_cache.get(cache_request)
     if cached_result is not None:
         logger.info(f"Returning cached result for query: {request.query[:50]}...")
-        # Add latency info for cached response
-        cached_result["latency_ms"] = 1.0  # Minimal latency for cached responses
-        return cached_result
+        # Cached responses report minimal latency
+        return cached_result.model_copy(update={"latency_ms": 1.0})
 
     start_time = time.time()
 
@@ -397,9 +406,10 @@ async def ask_question(
             final_docs = retrieved_docs[:request.top_k]
             final_scores = scores[:request.top_k]
 
-        # Generate answer
+        # Generate answer (GenerationResult is a dataclass -> attribute access)
         answer_result = rag_pipeline["answer_generator"].generate_answer_with_context(
             request.query, final_docs)
+        answer_text = answer_result.answer
 
         # Format sources for response
         sources = []
@@ -420,7 +430,7 @@ async def ask_question(
 
         # Prepare response
         response = QueryResponse(
-            answer=answer_result["answer"],
+            answer=answer_text,
             sources=sources,
             context_used=context_used,
             query=request.query,
@@ -563,7 +573,7 @@ async def ingest_documents(
             cleaned_docs = clean_documents(raw_docs)
             chunked_docs = chunk_documents(
                 cleaned_docs,
-                chunk_size=request.chunk_strategy,
+                chunk_size=request.chunk_size,
                 chunk_overlap=request.chunk_overlap,
                 strategy=request.chunk_strategy
             )

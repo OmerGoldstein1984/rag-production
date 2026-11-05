@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      # Tests are fully mocked: no NVIDIA_API_KEY needed, no network calls to NVIDIA.
+      - run: python -m pytest tests/ -q
+      - run: python -m pytest test_advanced_components.py test_evaluation.py -q || true
+
+  import-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Import all modules (no API key, no network)
+        run: |
+          python -c "
+          import src.config, src.api.main, src.evaluation.run_eval
+          import providers.llm, providers.llm_nvidia, providers.embeddings
+          import src.retrieval.hybrid, src.retrieval.retriever, src.retrieval.reranker
+          import src.retrieval.sparse_retriever, src.retrieval.query_rewriter, src.retrieval.conversation_memory
+          print('all imports OK')
+          "
