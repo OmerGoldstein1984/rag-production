@@ -818,6 +818,48 @@ async def reindex_documents(
     return result
 
 
+class AgentRequest(BaseModel):
+    question: str
+    use_llm_planner: bool = False
+    is_admin: bool = False  # caller asserts admin; enforced server-side via role below
+
+
+@app.post("/agent/ask")
+async def agent_ask(
+    request: AgentRequest,
+    user_info: dict = Depends(verify_user_role),
+    _token: None = Depends(verify_api_token),
+):
+    """Controlled tool-calling agent: validated, allow-listed, traced, step-capped."""
+    if rag_pipeline is None:
+        raise HTTPException(status_code=503, detail="RAG pipeline not initialized")
+
+    from src.agent import RAGAgent, ToolContext
+    from src.observability import metrics, get_request_id, Trace, record_trace
+
+    store = rag_pipeline["vector_store"]
+    ctx = ToolContext(
+        retriever=rag_pipeline["retriever"],
+        vector_store=store,
+        doc_manager=doc_manager,
+        answer_generator=rag_pipeline["answer_generator"],
+        is_admin=bool(user_info.get("can_ingest")),  # admin role required for admin tools
+        collection_metas=(lambda: store.collection.get(include=["metadatas"])["metadatas"]
+                          if store.collection is not None
+                          else [d.get("metadata", {}) for d in store._fallback_documents]),
+    )
+    agent = RAGAgent(ctx, provider=rag_pipeline.get("llm_provider"),
+                     use_llm_planner=request.use_llm_planner)
+
+    trace = Trace(request_id=get_request_id())
+    metrics.inc("agent_requests_total")
+    with trace.stage("agent", question=request.question[:80]):
+        result = agent.run(request.question)
+    metrics.inc("agent_tool_calls", len(result.tool_calls))
+    record_trace(trace)
+    return result.to_dict()
+
+
 @app.post("/feedback", response_model=FeedbackResponse)
 async def submit_feedback(
     request: FeedbackRequest,
