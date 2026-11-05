@@ -322,35 +322,72 @@ app = FastAPI(
     version="2.0.0"
 )
 
-# Middleware for request logging
+# Middleware for request logging (structured, with request id + metrics)
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """Log all incoming requests."""
-    request_id = str(uuid.uuid4())
+    """Assign a request id, log JSON request/response, record metrics + trace."""
+    from src.observability import new_request_id, metrics, Trace, record_trace
+
+    request_id = new_request_id()
+    trace = Trace(request_id=request_id)
     start_time = time.time()
+    metrics.inc("requests_total")
 
-    # Log request
-    logger.info(
-        f"Request {request_id}: {request.method} {request.url.path} "
-        f"from {request.client.host if request.client else 'unknown'}"
-    )
+    logger.info(f"request start {request.method} {request.url.path}")
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        metrics.inc_error(type(e).__name__)
+        trace.error = str(e)
+        record_trace(trace)
+        raise
 
-    # Process request
-    response = await call_next(request)
-
-    # Log response
-    process_time = time.time() - start_time
-    logger.info(
-        f"Request {request_id}: Completed in {process_time:.3f}s "
-        f"with status {response.status_code}"
-    )
-
+    process_ms = (time.time() - start_time) * 1000.0
+    metrics.observe_latency("request_ms", process_ms)
+    if response.status_code >= 400:
+        metrics.inc_error(f"http_{response.status_code}")
+    response.headers["X-Request-Id"] = request_id
+    logger.info(f"request done {request.method} {request.url.path} "
+                f"status={response.status_code} ms={process_ms:.1f}")
+    record_trace(trace)
     return response
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize the RAG pipeline on startup."""
+    from src.config import get_settings
+    from src.observability import setup_logging
+
+    setup_logging(level=get_settings().log_level, structured=True)
+    logger.info("structured JSON logging enabled")
     initialize_rag_pipeline()
+
+
+@app.get("/metrics")
+async def get_metrics(_token: None = Depends(verify_api_token)):
+    """In-memory metrics snapshot: counters, latency percentiles, tokens, errors."""
+    from src.observability import metrics
+
+    return metrics.snapshot()
+
+
+@app.get("/traces")
+async def get_traces(limit: int = 20, _token: None = Depends(verify_api_token)):
+    """Recent per-request traces (pipeline stages with timings)."""
+    from src.observability import get_recent_traces
+
+    return {"traces": get_recent_traces(limit)}
+
+
+@app.get("/provider")
+async def provider_status(_token: None = Depends(verify_api_token)):
+    """Which LLM provider/model is active — makes a mock impossible to hide."""
+    prov = rag_pipeline.get("llm_provider") if rag_pipeline else None
+    if prov is None:
+        return {"provider": "none", "model": None, "note": "pipeline not initialized"}
+    info = prov.get_model_info()
+    return {"provider": info.get("provider"), "model": info.get("model_name"),
+            "is_real": info.get("provider") != "mock"}
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
@@ -427,42 +464,52 @@ async def ask_question(
     if rag_pipeline is None:
         raise HTTPException(status_code=503, detail="RAG pipeline not initialized")
 
+    from src.observability import get_request_id, metrics, Trace, record_trace
+    trace = Trace(request_id=get_request_id())
+
     try:
         # Generate feedback ID for tracking
         feedback_id = str(uuid.uuid4())
 
-        # Apply user access level filtering (simplified - in production this would filter documents)
-        # For now, we'll log the access level but process normally
         logger.info(f"Processing query from user with access level: {user_info['access_level']} ({user_info['role']})")
 
-        # Retrieve documents
-        retrieved_docs_with_scores = rag_pipeline["retriever"].retrieve(
-            request.query,
-            k=request.top_k * 2 if request.use_reranker else request.top_k,  # Get extra for reranking
-            current_version_only=request.current_version_only
-        )
-
+        # Retrieve documents (traced)
+        with trace.stage("retrieve", k=request.top_k, hybrid=request.use_hybrid):
+            retrieved_docs_with_scores = rag_pipeline["retriever"].retrieve(
+                request.query,
+                k=request.top_k * 2 if request.use_reranker else request.top_k,
+                current_version_only=request.current_version_only
+            )
+        metrics.observe_latency("retrieve_ms", (time.time() - start_time) * 1000.0)
         retrieved_docs = [doc for doc, _ in retrieved_docs_with_scores]
         scores = [score for _, score in retrieved_docs_with_scores]
+        metrics.inc("retrieved_chunks", len(retrieved_docs))
 
-        # Rerank if requested and available
+        # Rerank if requested and available (traced)
         if request.use_reranker and rag_pipeline["reranker"] is not None:
-            reranked_docs_with_scores = rag_pipeline["reranker"].rerank(
-                request.query,
-                list(zip(retrieved_docs, scores)),
-                k=request.top_k
-            )
+            with trace.stage("rerank", k=request.top_k):
+                reranked_docs_with_scores = rag_pipeline["reranker"].rerank(
+                    request.query,
+                    list(zip(retrieved_docs, scores)),
+                    k=request.top_k
+                )
             final_docs = [doc for doc, _ in reranked_docs_with_scores]
             final_scores = [score for _, score in reranked_docs_with_scores]
         else:
-            # Use top k from initial retrieval
             final_docs = retrieved_docs[:request.top_k]
             final_scores = scores[:request.top_k]
 
-        # Generate answer (GenerationResult is a dataclass -> attribute access)
-        answer_result = rag_pipeline["answer_generator"].generate_answer_with_context(
-            request.query, final_docs)
+        # Generate answer with the real provider (traced); record usage
+        with trace.stage("llm", provider=rag_pipeline.get("llm_provider", {}).get_model_info().get("provider") if rag_pipeline.get("llm_provider") else "none"):
+            answer_result = rag_pipeline["answer_generator"].generate_answer_with_context(
+                request.query, final_docs)
         answer_text = answer_result.answer
+        usage = answer_result.metadata.get("usage")
+        if usage:
+            metrics.add_tokens(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+        metrics.inc("answers_generated")
+        metrics.observe_latency("llm_ms", answer_result.metadata.get("answer_generation_latency_ms", 0.0))
+        record_trace(trace)
 
         # Format sources for response
         sources = []
