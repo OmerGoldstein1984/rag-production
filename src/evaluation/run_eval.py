@@ -1,5 +1,27 @@
 """
-End-to-end evaluation script for RAG systems with configurable experiments.
+src/evaluation/run_eval.py - End-to-end RAG evaluation script with configurable experiments.
+
+BUSINESS PROBLEM: Runs reproducible, configurable end-to-end evaluations of the
+telecom RAG pipeline (single question, golden set, ablation study, configuration
+comparison) and writes results to markdown/JSON. It is the harness that answers
+"does this chunking/retrieval/reranker change actually improve QA quality?"
+
+WHERE IT SITS IN THE DATA FLOW: At the end of the flow, after documents are
+ingested and the pipeline is wired. It ingests/indexes documents itself, runs
+retrieve -> (rerank) -> generate per question, scores with RAGEvaluator, and
+writes reports. It does not serve live traffic.
+
+WHAT CALLS IT: python -m src.evaluation.run_eval (CLI via argparse), CI jobs,
+and developers comparing pipeline configurations.
+
+WHAT IT CALLS: src.ingestion.* (loaders, cleaner, chunker), src.embedding.embedder,
+src.store.vector_store, src.retrieval.* (retriever, reranker, hybrid, sparse_retriever,
+reciprocal_rank_fusion, _doc_key), src.generation.* (answer, prompt),
+src.evaluation.metrics (RAGEvaluator, RetrievalMetrics, GenerationMetrics),
+providers.llm.create_llm_provider_from_env.
+
+WHAT BREAKS IF REMOVED: There is no scripted way to run golden-set or ablation
+evaluations; pipeline changes cannot be measured before deploy.
 """
 
 import json
@@ -10,6 +32,7 @@ from pathlib import Path
 import itertools
 
 # Add project root to path for imports
+# Allows `src.*` imports when this file is run directly as a script.
 project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
 
@@ -35,6 +58,26 @@ def make_llm_judge():
     Returns a callable(prompt) -> str. With LLM_PROVIDER=mock this is the mock
     (CI-safe, no key); with nvidia it is the real NVIDIA model. Judge limitations
     are documented in learn/04-evaluation.md — it is not ground truth.
+
+    WHAT: Factory that creates a judge(prompt)->str closure backed by the
+    provider selected via LLM_PROVIDER env var.
+    WHY: Supplies the LLM judge used by GenerationMetrics for relevance,
+    faithfulness, and contradiction scoring without hardcoding a provider.
+    INPUTS: none (reads LLM_PROVIDER from env inside create_llm_provider_from_env).
+    OUTPUTS: a callable judge(prompt: str) -> str.
+    SIDE EFFECTS: instantiates an LLM provider (may read env / hit network).
+    FAILURE MODES: if provider.generate raises, the closure catches it, logs a
+        warning, and returns "0" (a neutral low score) so evaluation does not
+        crash on judge failure.
+    ALTERNATIVE: inject a fixed judge function directly instead of building one
+        from env.
+    # GAP: resilience - judge failures degrade to "0" silently; there is no
+        retry/backoff and no circuit breaker.
+    # BUSINESS: enables LLM-as-judge scoring in CI (mock) and prod (NVIDIA)
+        without code changes.
+    # INTERVIEW: "Why return '0' on judge error instead of re-raising?" - so a
+        transient judge outage does not abort an entire golden-set evaluation;
+        the score is just conservatively low.
     """
     from providers.llm import create_llm_provider_from_env
 
@@ -51,7 +94,33 @@ def make_llm_judge():
 
 
 class RAGEvaluationPipeline:
-    """Complete RAG pipeline for evaluation with configurable components."""
+    """End-to-end RAG pipeline for evaluation with configurable components.
+
+    WHAT: Wires together ingestion (load->clean->chunk->embed->index), retrieval
+    (dense, optional BM25 hybrid with RRF or weighted fusion), optional reranking,
+    and answer generation, then scores each question with RAGEvaluator.
+    WHY: Lets experiments toggle chunking/hybrid/rerank/RRF/prompt and measure
+    the impact on retrieval and generation metrics for the telecom QA system.
+    INPUTS: chunk_strategy, chunk_size, chunk_overlap, use_hybrid, use_reranker,
+        use_rrf, hybrid_alpha (0-1), prompt_version, llm_judge_fn optional.
+    OUTPUTS: none directly; methods return evaluation result dicts.
+    SIDE EFFECTS: creates a vector store and reranker at construction; reads
+        filesystem and (via make_llm_judge) may hit network when judging.
+    FAILURE MODES: __init__ does not fail if retrieval components fail (those
+        are created lazily in ingest_and_index_documents); evaluate_* raises
+        RuntimeError if ingest_and_index_documents was not called first.
+    ALTERNATIVE: call src.ingestion / src.retrieval / src.generation modules
+        directly instead of this orchestrating class.
+    # GAP: concurrency - no locking; two threads sharing one pipeline could
+        race on self.sparse_retriever / self.retriever initialization.
+    # GAP: retries - ingest_and_index_documents does not retry embedding or
+        vector-store writes on transient failure.
+    # BUSINESS: is the experiment harness that tells FDE learners whether a
+        retrieval change actually moves telecom QA quality.
+    # INTERVIEW: "Why create the vector store and reranker in __init__ but the
+        retriever only at ingest time?" - because the retriever needs the
+        embedder, which is only built after documents are embedded.
+    """
 
     def __init__(self,
                  chunk_strategy: str = "recursive",
@@ -63,19 +132,29 @@ class RAGEvaluationPipeline:
                  hybrid_alpha: float = 0.7,
                  prompt_version: str = "grounded_v1",
                  llm_judge_fn: Optional[callable] = None):
-        """
-        Initialize the RAG evaluation pipeline with configurable components.
+        """Configure and pre-wire the evaluation pipeline components.
 
-        Args:
-            chunk_strategy: Chunking strategy ("fixed_size", "recursive", "structure_aware")
-            chunk_size: Size of chunks in tokens/characters
-            chunk_overlap: Overlap between chunks
-            use_hybrid: Whether to use hybrid retrieval (BM25 + dense)
-            use_reranker: Whether to use reranking
-            use_rrf: Whether to use RRF for hybrid retrieval (if use_hybrid is True)
-            hybrid_alpha: Weight for dense retrieval in hybrid (0-1, 1-alpha for BM25)
-            prompt_version: Version of prompt template to use
-            llm_judge_fn: Optional LLM judge function for faithfulness and relevance
+        WHAT: Stores config, creates an empty vector store, a reranker, an
+        answer generator, a PromptEngineer, and a RAGEvaluator; leaves
+        embedder/retriever/sparse_retriever for lazy init at ingest time.
+        WHY: Separates configuration from the expensive ingestion so multiple
+        experiments can share the same component factory pattern.
+        INPUTS: chunk_strategy="recursive"; chunk_size=500; chunk_overlap=50;
+            use_hybrid=True; use_reranker=True; use_rrf=False;
+            hybrid_alpha=0.7; prompt_version="grounded_v1"; llm_judge_fn=None.
+        OUTPUTS: none (sets instance attributes; is_ready=False).
+        SIDE EFFECTS: calls create_vector_store() and create_reranker() and
+            create_answer_generator() at construction.
+        FAILURE MODES: if create_reranker or create_answer_generator fails at
+            construction, __init__ raises before the object exists.
+        ALTERNATIVE: lazy-create every component inside ingest_and_index_documents.
+        # GAP: validation - hybrid_alpha is not range-checked (0-1); an out-of-
+            range alpha silently distorts the weighted fusion.
+        # BUSINESS: centralizes the experiment knobs so ablation studies vary
+            one thing at a time.
+        # INTERVIEW: "Why is is_ready False until ingest runs?" - because the
+            retriever and BM25 corpus depend on embedded documents that do not
+            exist yet.
         """
         logger.info("Initializing RAG evaluation pipeline...")
 
@@ -91,11 +170,11 @@ class RAGEvaluationPipeline:
         self.llm_judge_fn = llm_judge_fn
 
         # Initialize components
-        self.embedder = None  # Will be initialized when needed
-        self.vector_store = create_vector_store()
+        self.embedder = None  # Will be initialized when needed (after embed docs)
+        self.vector_store = create_vector_store()  # empty vector store to fill at ingest
         self.retriever = None  # Will be initialized after vector store is populated
-        self.hybrid_retriever = None  # Will be initialized if using hybrid
-        self.sparse_retriever = None  # BM25 retriever for hybrid
+        self.hybrid_retriever = None  # Will be initialized if using hybrid (unused placeholder)
+        self.sparse_retriever = None  # BM25 retriever for hybrid (lazy)
         self.reranker = create_reranker()
         self.answer_generator = create_answer_generator()
         self.prompt_engineer = PromptEngineer()
@@ -105,11 +184,32 @@ class RAGEvaluationPipeline:
         self.is_ready = False
 
     def ingest_and_index_documents(self, data_directory: str) -> None:
-        """
-        Ingest documents from directory and index them in the vector store.
+        """Load, clean, chunk, embed, and index documents; build retriever + BM25.
 
         Args:
             data_directory: Path to directory containing documents
+
+        WHAT: Runs the full ingestion pipeline (load -> clean -> chunk -> embed
+        -> index into vector store), builds the dense retriever and optional BM25
+        sparse retriever, and marks the pipeline ready.
+        WHY: Prepares the search index that evaluate_single_question queries
+        against; must run before any evaluation.
+        INPUTS: data_directory e.g. "data/raw".
+        OUTPUTS: none (sets self.is_ready=True, self._corpus, self.embedder,
+            self.retriever, self.sparse_retriever).
+        SIDE EFFECTS: reads the filesystem, writes to the vector store, logs at
+            each stage.
+        FAILURE MODES: raises if document loading/embedding fails; is_ready
+            stays False so later evaluate calls raise RuntimeError.
+        ALTERNATIVE: incremental indexing (add docs without rebuilding) instead
+            of full rebuild each call.
+        # GAP: retries - no retry/backoff around load_documents_from_directory
+            or embed_documents on transient failure.
+        # BUSINESS: produces the searchable telecom document corpus used to
+            score retrieval quality.
+        # INTERVIEW: "Why rebuild BM25 and dense index from scratch on every
+            ingest call?" - simplicity and consistency; incremental adds risk of
+            drift between the vector store and the BM25 corpus.
         """
         logger.info(f"Ingesting documents from {data_directory}")
         logger.info(f"Configuration: chunk_strategy={self.chunk_strategy}, "
@@ -160,7 +260,24 @@ class RAGEvaluationPipeline:
         self.is_ready = True
 
     def _initialize_sparse_retriever(self, documents: List[Dict[str, Any]]) -> None:
-        """Initialize sparse retriever (BM25) with the corpus if not yet done."""
+        """Initialize sparse retriever (BM25) with the corpus if not yet done.
+
+        WHAT: Lazily creates a BM25 retriever over the given documents (or the
+        stored _corpus) if one does not exist yet.
+        WHY: BM25 is only needed for hybrid retrieval, so it is built on demand
+        rather than at construction.
+        INPUTS: documents list of dicts (may be empty; falls back to self._corpus).
+        OUTPUTS: none (sets self.sparse_retriever).
+        SIDE EFFECTS: creates and populates the BM25 retriever.
+        FAILURE MODES: if self._corpus is also unset and documents is empty,
+            BM25 gets no documents and retrieval returns empty.
+        ALTERNATIVE: build BM25 eagerly in ingest_and_index_documents regardless
+            of use_hybrid.
+        # BUSINESS: supports the BM25 half of hybrid retrieval for telecom term
+            matching.
+        # INTERVIEW: "Why fall back to self._corpus when documents is empty?" -
+            so _hybrid_retrieve can call this without re-passing the corpus.
+        """
         if self.sparse_retriever is None:
             from src.retrieval.sparse_retriever import create_bm25_retriever
             self.sparse_retriever = create_bm25_retriever()
@@ -169,14 +286,37 @@ class RAGEvaluationPipeline:
 
     def evaluate_single_question(self,
                                 question_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Evaluate the RAG pipeline on a single question.
+        """Evaluate the RAG pipeline on a single golden-set question.
 
         Args:
             question_data: Dictionary containing question information
 
         Returns:
             Evaluation results dictionary
+
+        WHAT: Runs retrieve -> (optional rerank) -> format context -> generate
+        answer, derives relevant doc IDs from expected terms, scores with
+        RAGEvaluator, and augments the result with question metadata and config.
+        WHY: Produces one scored evaluation record per golden-set question.
+        INPUTS: question_data dict {"question": str, "id": str,
+            "expected_answer_contains": [str], "expected_sources": [str]}.
+        OUTPUTS: dict with question_id, question, expected_*, config,
+            retrieval_details, plus nested retrieval/generation metrics.
+        SIDE EFFECTS: logs progress; invokes the LLM judge (via evaluator) if
+            configured.
+        FAILURE MODES: raises RuntimeError if is_ready is False; catches nothing
+            here - a per-question exception propagates to evaluate_golden_set
+            which logs and records an error result.
+        ALTERNATIVE: skip the pseudo-relevant fallback and score with empty
+            relevant_doc_ids (all zeros).
+        # GAP: validation - question_data["question"] is accessed with []
+            (KeyError if missing) while other fields use .get(); inconsistent.
+        # BUSINESS: the unit of evaluation - one telecom QA question scored end
+        to end.
+        # INTERVIEW: "Why use top 3 as pseudo-relevant when no expected terms
+            match?" - to avoid all-zero scores when the golden set's expected
+            terms do not appear in the retrieved chunks; it is a conservative
+            fallback so the metric is not degenerate.
         """
         if not self.is_ready:
             raise RuntimeError("Pipeline not ready. Call ingest_and_index_documents first.")
@@ -188,7 +328,8 @@ class RAGEvaluationPipeline:
 
         logger.info(f"Evaluating question {question_id}: {question}")
 
-        # Retrieve documents
+        # Retrieve documents: hybrid when enabled, else dense-only; fetch k=10
+        # (reranker will narrow to top-5 afterward).
         if self.use_hybrid:
             retrieved_results = self._hybrid_retrieve(question, k=10)
         else:
@@ -201,7 +342,7 @@ class RAGEvaluationPipeline:
         retrieved_docs = [doc for doc, _ in retrieved_results]
         retrieval_scores = [score for _, score in retrieved_results]
 
-        # Rerank documents if enabled
+        # Rerank documents if enabled: cross-encoder re-orders for relevance.
         if self.use_reranker and retrieved_docs:
             reranked_results = self.reranker.rerank(
                 question,
@@ -211,7 +352,7 @@ class RAGEvaluationPipeline:
             final_docs = [doc for doc, _ in reranked_results]
             final_scores = [score for _, score in reranked_results]
         else:
-            # Use top k from initial retrieval
+            # Use top k from initial retrieval (no reranking).
             final_docs = retrieved_docs[:5]
             final_scores = retrieval_scores[:5]
 
@@ -223,7 +364,8 @@ class RAGEvaluationPipeline:
             question, final_docs)
         generated_answer = answer_result.answer
 
-        # Determine relevant document IDs based on expected terms
+        # Determine relevant document IDs based on expected terms: a retrieved
+        # doc is "relevant" if its content contains any expected term.
         relevant_doc_ids = set()
         expected_terms_lower = [term.lower() for term in expected_terms]
 
@@ -244,7 +386,7 @@ class RAGEvaluationPipeline:
             logger.debug(f"No expected terms found in retrieved docs for question {question_id}, "
                         f"using top 3 as pseudo-relevant for evaluation")
 
-        # Evaluate the pipeline
+        # Evaluate the pipeline (retrieval + generation metrics).
         evaluation_result = self.evaluator.evaluate_rag_pipeline(
             query=question,
             retrieved_docs=final_docs,
@@ -278,8 +420,7 @@ class RAGEvaluationPipeline:
         return evaluation_result
 
     def _hybrid_retrieve(self, query: str, k: int = 10) -> List[Tuple[Dict[str, Any], float]]:
-        """
-        Perform hybrid retrieval (BM25 + dense) with optional RRF.
+        """Fuse dense and BM25 results, optionally with Reciprocal Rank Fusion.
 
         Args:
             query: Query string
@@ -287,6 +428,25 @@ class RAGEvaluationPipeline:
 
         Returns:
             List of (document, score) tuples
+
+        WHAT: Retrieves from dense and BM25 (search_k = max(k*3, 10) for a
+        candidate pool), then fuses via RRF if use_rrf else min-max normalized
+        weighted combination using hybrid_alpha.
+        WHY: Combines semantic (dense) and lexical (BM25) signals for better
+        retrieval than either alone on telecom terminology.
+        INPUTS: query string, k int (default 10).
+        OUTPUTS: list of (doc, score) tuples, trimmed to k.
+        SIDE EFFECTS: lazily initializes BM25 via _initialize_sparse_retriever;
+            logs a warning if BM25 is unavailable (dense-only fallback).
+        FAILURE MODES: if BM25 is None, falls back to dense-only results[:k].
+        ALTERNATIVE: use only dense or only BM25 (set use_hybrid=False).
+        # GAP: validation - hybrid_alpha is not clamped to [0,1]; out-of-range
+            values distort the weighted combination silently.
+        # BUSINESS: the hybrid retrieval path that ablation studies toggle to
+            measure BM25's contribution to telecom chunk matching.
+        # INTERVIEW: "Why retrieve k*3 candidates before fusion?" - fusion
+            re-ranks, so a wider candidate pool lets the fused ranking surface
+            good docs that ranked mediocre in either list alone.
         """
         from src.retrieval.retriever import reciprocal_rank_fusion
 
@@ -332,14 +492,36 @@ class RAGEvaluationPipeline:
             return out[:k]
 
     def evaluate_golden_set(self, golden_set_path: str) -> Dict[str, Any]:
-        """
-        Evaluate the RAG pipeline on a golden set of questions.
+        """Evaluate the pipeline on every question in a golden-set JSON file.
 
         Args:
             golden_set_path: Path to golden set JSON file
 
         Returns:
             Aggregated evaluation results
+
+        WHAT: Loads the golden set, runs evaluate_single_question per question
+        (capturing per-question errors as error records), aggregates metrics,
+        and returns individual + aggregate results with config.
+        WHY: Produces a reproducible, comparable score across all golden-set
+        questions for a given pipeline configuration.
+        INPUTS: golden_set_path string pointing to JSON with a "questions" list.
+        OUTPUTS: dict {"individual_results": [...], "aggregate_metrics": {...},
+            "total_questions": int, "successful_evaluations": int,
+            "configuration": {...}}.
+        SIDE EFFECTS: reads the golden-set JSON file; logs per-question progress
+        and errors.
+        FAILURE MODES: a single question's failure is caught and recorded as an
+        error record (does not abort the whole set); missing file raises
+        FileNotFoundError.
+        ALTERNATIVE: fail-fast on the first question error instead of continuing.
+        # GAP: resilience - no retry on transient per-question failures (e.g.
+            judge timeout); they are recorded as errors and skipped.
+        # BUSINESS: the main reproducibility tool for measuring telecom QA
+            quality before/after a pipeline change.
+        # INTERVIEW: "Why record per-question errors instead of aborting?" -
+            so one bad question does not discard scores for all the others;
+            the aggregate still reflects the rest of the set.
         """
         logger.info(f"Loading golden set from {golden_set_path}")
 
@@ -396,14 +578,34 @@ class RAGEvaluationPipeline:
         }
 
     def _aggregate_results(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Aggregate evaluation results across questions.
+        """Average retrieval and generation metrics across valid question results.
 
         Args:
             results: List of individual question results
 
         Returns:
             Dictionary of aggregated metrics
+
+        WHAT: Filters out error records, then averages each retrieval and
+        generation metric across the remaining answers (completeness averaged
+        only over questions that had expected_keywords).
+        WHY: Collapses many per-question scores into one comparable aggregate
+        per configuration.
+        INPUTS: results list of dicts (may include "error" records).
+        OUTPUTS: dict {"retrieval": {...avg...}, "generation": {...avg...},
+            "num_questions_evaluated": int} or {"error": ...} if none valid.
+        SIDE EFFECTS: none.
+        FAILURE MODES: returns an error dict when no valid results exist.
+        ALTERNATIVE: report medians or per-question distributions instead of
+            means (means hide variance).
+        # GAP: observability - no variance/stddev is reported, so a high mean
+            could hide a few catastrophic failures.
+        # BUSINESS: one comparable number per pipeline configuration for the
+            ablation / comparison reports.
+        # INTERVIEW: "Why average completeness only over questions that had
+            expected_keywords?" - because completeness is undefined (not 0)
+            when there are no required keywords; averaging zeros would
+            understate it.
         """
         # Filter out results with errors
         valid_results = [r for r in results if "error" not in r]
@@ -467,8 +669,7 @@ class RAGEvaluationPipeline:
         }
 
     def run_ablation_study(self, golden_set_path: str, base_config: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Run an ablation study comparing baseline vs each improvement.
+        """Compare baseline vs each pipeline improvement on the golden set.
 
         Args:
             golden_set_path: Path to golden set JSON file
@@ -476,6 +677,29 @@ class RAGEvaluationPipeline:
 
         Returns:
             Ablation study results
+
+        WHAT: Defines several pipeline configurations (baseline, chunking,
+        hybrid, hybrid+RRF, reranking, llm-as-judge, advanced prompting),
+        overrides each with base_config, runs a full golden-set evaluation for
+        each, and returns per-config results.
+        WHY: Isolates the contribution of each RAG component to overall quality
+        so the team knows what to invest in.
+        INPUTS: golden_set_path string, base_config dict of config overrides.
+        OUTPUTS: dict {config_name: evaluation_results}.
+        SIDE EFFECTS: re-ingests/re-indexes documents for each configuration
+            (expensive), logs progress.
+        FAILURE MODES: a failing configuration aborts the whole study (no try
+            around the per-config loop).
+        ALTERNATIVE: share one index across configs where only retrieval knobs
+            differ, instead of re-ingesting each time.
+        # GAP: resilience - no per-config try/except; one bad config fails the
+            entire ablation study.
+        # BUSINESS: quantifies which component (chunking/hybrid/rerank/prompt)
+            moves telecom QA metrics most.
+        # INTERVIEW: "Why re-ingest documents for every configuration?" -
+            because chunk_size/strategy change the indexed chunks themselves,
+            so the index must be rebuilt; only retrieval-only knobs could share
+            an index.
         """
         logger.info("Running ablation study...")
 
@@ -590,12 +814,23 @@ class RAGEvaluationPipeline:
         return ablation_results
 
 def save_results_to_markdown(results: Dict[str, Any], output_path: str) -> None:
-    """
-    Save evaluation results to a markdown file.
+    """Write evaluation results (aggregate + first 10 questions) to markdown.
 
     Args:
         results: Evaluation results dictionary
         output_path: Path to output markdown file
+
+    WHAT: Renders aggregate retrieval/generation metrics, configuration, and the
+    first 10 individual question results into a markdown report file.
+    WHY: Produces a human-readable report for reviewing experiment outcomes.
+    INPUTS: results dict (from evaluate_golden_set or ablation), output_path.
+    OUTPUTS: none (writes a file).
+    SIDE EFFECTS: creates/overwrites the output markdown file.
+    FAILURE MODES: raises IOError if the output path is not writable.
+    ALTERNATIVE: emit JSON/HTML instead of markdown.
+    # BUSINESS: gives FDE learners a scannable report of which metrics changed.
+    # INTERVIEW: "Why only show the first 10 questions?" - to keep the report
+        short; full detail remains in the JSON/results dict.
     """
     with open(output_path, 'w') as f:
         f.write("# RAG System Evaluation Results\n\n")
@@ -643,13 +878,32 @@ def save_results_to_markdown(results: Dict[str, Any], output_path: str) -> None:
                     f.write(f"**Error:** {result.get('error', 'Unknown error')}\n\n")
                     f.write("---\n\n")
 
+
 def run_comparison_evaluation(golden_set_path: str, output_dir: str) -> None:
-    """
-    Run a comparison evaluation with different configurations and save results.
+    """Run several pipeline configurations and write a comparison report.
 
     Args:
         golden_set_path: Path to golden set JSON file
         output_dir: Directory to save results
+
+    WHAT: Defines six configurations (baseline through advanced_pipeline),
+    evaluates each on the golden set, saves per-config JSON and a combined
+    markdown comparison table.
+    WHY: Lets stakeholders compare configurations side by side on the same
+    golden set.
+    INPUTS: golden_set_path string, output_dir string.
+    OUTPUTS: none (writes files to output_dir).
+    SIDE EFFECTS: creates output_dir, writes one JSON per config and a
+        comparison_results.md; re-ingests documents per config.
+    FAILURE MODES: a failing config aborts the whole comparison (no per-config
+        try/except).
+    ALTERNATIVE: run configurations in parallel to cut wall-clock time.
+    # GAP: concurrency - configurations run sequentially; each re-ingests the
+        corpus, so wall-clock is linear in the number of configs.
+    # BUSINESS: the side-by-side report used to pick a production configuration.
+    # INTERVIEW: "Why not parallelize the configs?" - each config re-ingests and
+        re-indexes; parallelizing would multiply concurrent disk/vector-store
+        load and complicate result aggregation.
     """
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
@@ -799,8 +1053,35 @@ def run_comparison_evaluation(golden_set_path: str, output_dir: str) -> None:
         f.write("4. **Impact of Reranking**: Comparing hybrid_rrf vs full_pipeline shows the value of cross-encoder reranking.\n")
         f.write("5. **Impact of Advanced Prompting**: Comparing full_pipeline vs advanced_pipeline shows the value of improved prompts.\n")
 
+
 def main():
-    """Main evaluation function."""
+    """CLI entry point: run standard, ablation, or comparison evaluation.
+
+    WHAT: Parses argparse flags, builds the pipeline (with or without LLM judge),
+    ingests documents, and runs either an ablation study, a configuration
+    comparison, or a standard single evaluation, writing results to disk.
+    WHY: Provides the command-line interface developers/CI use to measure RAG
+    quality before deploy.
+    INPUTS: CLI args (--data-dir, --golden-set, --output, --chunk-*,
+        --use-hybrid/--no-hybrid, --use-reranker/--no-reranker,
+        --use-rrf/--no-rrf, --hybrid-alpha, --prompt-version,
+        --run-ablation, --run-comparison, --output-dir, --no-judge).
+    OUTPUTS: none (writes markdown/JSON files; logs progress).
+    SIDE EFFECTS: creates output directories, writes files, ingests/indexes
+        documents, may invoke the LLM judge (network/cost).
+    FAILURE MODES: missing golden-set file raises FileNotFoundError; unwritable
+        output raises IOError; judge errors degrade to "0" scores (see
+        make_llm_judge).
+    ALTERNATIVE: call RAGEvaluationPipeline directly from Python instead of the
+        CLI.
+    # GAP: resilience - no retry on ingestion or judge failure; a transient
+        error aborts the run.
+    # BUSINESS: is the entry point CI/developers use to gate telecom QA quality
+        changes.
+    # INTERVIEW: "Why default --use-hybrid and --use-reranker to True?" -
+        because the recommended production configuration enables both; the
+        flags let you opt out for ablation.
+    """
     import argparse
 
     parser = argparse.ArgumentParser(description="Evaluate RAG system")

@@ -32,15 +32,49 @@ logger = logging.getLogger(__name__)
 
 
 class RAGChat:
-    """CLI chat interface for RAG system."""
+    """
+    CLI chat interface for RAG system.
+
+    WHAT: Encapsulates the full RAG pipeline (ingest -> embed -> store ->
+    retrieve -> rerank -> generate) and exposes a query() method plus an
+    interactive chat_loop() for a command-line chat experience.
+    WHY: It is the end-to-end demo/entry point showing how all RAG components
+    compose: load docs, clean, chunk, embed, index in a vector store, retrieve
+    (dense/sparse/hybrid), rerank, and generate a grounded answer.
+    INPUTS (__init__): data_directory: str (default "./data/raw"); use_advanced_retrieval:
+        bool (default False).
+    OUTPUTS (query): GenerationResult — answer, sources, latency, token counts,
+        metadata.
+    SIDE EFFECTS: __init__ runs the full ingestion+indexing pipeline (reads
+    disk, embeds, writes to vector store); chat_loop() reads stdin and writes
+    stdout; logging configured at import.
+    FAILURE MODES: __init__ raises if documents can't be loaded/embedded or the
+    vector store can't be created; query() logs errors and re-raises inside
+    chat_loop's try/except (so one bad question doesn't kill the loop).
+    ALTERNATIVE: A FastAPI endpoint (src/api/main.py) serves the same pipeline
+    over HTTP instead of a CLI.
+    # GAP: __init__ re-ingests and re-indexes on every RAGChat construction — no
+    persistence/reuse of an existing index, so repeated CLI invocations duplicate
+    work.
+    """
 
     def __init__(self, data_directory: str = "./data/raw", use_advanced_retrieval: bool = False):
         """
         Initialize the RAG chat system.
 
-        Args:
-            data_directory: Directory containing source documents
-            use_advanced_retrieval: Whether to use advanced retrieval techniques (RRF hybrid, etc.)
+        WHAT: Store config and run _initialize_pipeline() to ingest, embed, and
+        index documents plus build retrievers and the answer generator.
+        WHY: Constructing RAGChat performs the expensive one-time setup so each
+        query() call is fast.
+        INPUTS: data_directory: str — e.g. "./data/raw" (folder of source docs);
+            use_advanced_retrieval: bool — whether to use RRF hybrid retrieval.
+        OUTPUTS: None (instance).
+        SIDE EFFECTS: Runs full ingestion pipeline (disk I/O, embedding,
+        vector-store writes); sets self.vector_store, self.retriever, etc.
+        FAILURE MODES: Raises if load_documents_from_directory, embed_documents,
+        or create_vector_store fail.
+        ALTERNATIVE: Accept a pre-built vector store/retriever instead of
+        rebuilding from scratch each time.
         """
         self.data_directory = data_directory
         self.use_advanced_retrieval = use_advanced_retrieval
@@ -52,7 +86,21 @@ class RAGChat:
         self._initialize_pipeline()
 
     def _initialize_pipeline(self):
-        """Initialize the RAG pipeline components."""
+        """
+        Initialize the RAG pipeline components.
+
+        WHAT: Execute load -> clean -> chunk -> embed -> store, then build dense
+        + sparse + hybrid retrievers, a reranker, and the answer generator.
+        WHY: This is the composition root that wires all RAG stages together
+        before any query can be served.
+        INPUTS: None (uses self.data_directory, self.use_advanced_retrieval).
+        OUTPUTS: None (sets instance attributes).
+        SIDE EFFECTS: Reads documents from disk; calls embedding (may download
+        model); writes to vector store; logs INFO at each stage.
+        FAILURE MODES: Raises if any stage (load/clean/chunk/embed/store) fails.
+        ALTERNATIVE: Lazily initialize components on first query instead of at
+        construction.
+        """
         logger.info("Initializing RAG pipeline...")
 
         # Load and process documents
@@ -115,15 +163,30 @@ class RAGChat:
         """
         Process a query through the RAG pipeline.
 
-        Args:
-            question: User question
-            use_hybrid: Whether to use hybrid search
-            use_reranker: Whether to use reranking
-            top_k: Number of results to retrieve
-            current_version_only: Whether to filter to current document versions only
-
-        Returns:
-            GenerationResult with answer and metadata
+        WHAT: Retrieve relevant docs (dense/sparse/hybrid), optionally rerank,
+        then generate a grounded answer via the answer generator.
+        WHY: This is the core request path — turns a user question into a
+        sourced answer with latency and token metadata.
+        INPUTS: question: str — e.g. "How many remote days are allowed?";
+            use_hybrid: bool (default True); use_reranker: bool (default True);
+            top_k: int (default 5); current_version_only: bool (default True).
+        OUTPUTS: GenerationResult — answer string, sources list, latency_ms,
+            token_counts, metadata.
+        SIDE EFFECTs: Logs INFO per stage; retrieves from vector store; calls
+        the LLM (network) via answer_generator.
+        FAILURE MODES: Catches nothing here — exceptions propagate to chat_loop
+        (which catches and prints) or to the CLI caller. If no docs retrieved,
+        the answer generator still runs with empty context and returns an
+        insufficiency message.
+        ALTERNATIVE: Skip reranking/hybrid for lower latency at the cost of
+        relevance.
+        # GAP: The reranker branch reads self.retriever.reranker, but create_reranker()
+        result is stored in a local variable `reranker` that is never assigned to
+        self — so hasattr(self.retriever, 'reranker') may be False and the
+        reranker is effectively unused (dead local).
+        # INTERVIEW: Say it out loud — "Retrieve 2x top_k, rerank down to top_k,
+        then ground the answer in only those chunks — so the LLM never sees
+        unranked noise."
         """
         logger.info(f"Processing query: '{question}'")
 
@@ -179,7 +242,22 @@ class RAGChat:
         return result
 
     def chat_loop(self):
-        """Run an interactive chat loop."""
+        """
+        Run an interactive chat loop.
+
+        WHAT: Print a banner, then repeatedly read questions from stdin, run
+        query(), and print the answer/sources/latency until the user quits.
+        WHY: Provides a human-interactive way to exercise the RAG pipeline
+        without writing code or hitting the HTTP API.
+        INPUTS: None (reads stdin via input()).
+        OUTPUTS: None (prints to stdout).
+        SIDE EFFECTs: Blocks on stdin; prints to stdout; catches KeyboardInterrupt
+        and generic exceptions per iteration so the loop survives bad input.
+        FAILURE MODES: A KeyboardInterrupt/EOF exits gracefully; any other
+        exception is caught, logged, and printed — the loop continues.
+        ALTERNATIVE: A Streamlit UI (ui/streamlit_app.py) provides the same
+        interaction over a browser.
+        """
         print("RAG Academy Chat System")
         print("Type your questions about company policies. Type 'quit' to exit.")
         print("-" * 50)
@@ -217,7 +295,22 @@ class RAGChat:
 
 
 def main():
-    """Main CLI entry point."""
+    """
+    Main CLI entry point.
+
+    WHAT: Parse CLI args, build a RAGChat, and either run one question or the
+    interactive loop based on flags.
+    WHY: Standard `python -m src.generation.chat` entry point for manual testing
+    and demos.
+    INPUTS: None (reads sys.argv via argparse).
+    OUTPUTS: None (prints results to stdout).
+    SIDE EFFECTs: Configures logging level; constructs RAGChat (runs ingestion);
+    prints answer/sources/latency/tokens.
+    FAILURE MODES: Raises if RAGChat construction fails (bad data dir, embedding
+    failure, vector store failure).
+    ALTERNATIVE: Import RAGChat and call query() programmatically instead of the
+    CLI.
+    """
     parser = argparse.ArgumentParser(description="RAG Academy Chat System")
     parser.add_argument("question", nargs="?", help="Question to ask the RAG system")
     parser.add_argument("--data-dir", type=str, default="./data/raw",
