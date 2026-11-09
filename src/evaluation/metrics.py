@@ -94,8 +94,9 @@ class RetrievalMetrics:
         # Extract document IDs from retrieved documents
         retrieved_ids = set()
         for doc in top_k_docs:
-            # Try to get document ID from metadata
-            doc_id = doc.get("metadata", {}).get("doc_id")
+            # Try to get document ID from metadata (doc_id, then filename, then source)
+            metadata = doc.get("metadata", {})
+            doc_id = metadata.get("doc_id") or metadata.get("filename") or metadata.get("source")
             if doc_id:
                 retrieved_ids.add(doc_id)
             else:
@@ -137,8 +138,9 @@ class RetrievalMetrics:
         # Extract document IDs from retrieved documents
         retrieved_ids = set()
         for doc in top_k_docs:
-            # Try to get document ID from metadata
-            doc_id = doc.get("metadata", {}).get("doc_id")
+            # Try to get document ID from metadata (doc_id, then filename, then source)
+            metadata = doc.get("metadata", {})
+            doc_id = metadata.get("doc_id") or metadata.get("filename") or metadata.get("source")
             if doc_id:
                 retrieved_ids.add(doc_id)
             else:
@@ -179,7 +181,8 @@ class RetrievalMetrics:
         # Extract document IDs from retrieved documents
         retrieved_ids = set()
         for doc in top_k_docs:
-            doc_id = doc.get("metadata", {}).get("doc_id")
+            metadata = doc.get("metadata", {})
+            doc_id = metadata.get("doc_id") or metadata.get("filename") or metadata.get("source")
             if doc_id:
                 retrieved_ids.add(doc_id)
             else:
@@ -216,7 +219,8 @@ class RetrievalMetrics:
 
         # Find the rank of the first relevant document
         for rank, doc in enumerate(retrieved_docs):
-            doc_id = doc.get("metadata", {}).get("doc_id")
+            metadata = doc.get("metadata", {})
+            doc_id = metadata.get("doc_id") or metadata.get("filename") or metadata.get("source")
             if doc_id and doc_id in relevant_doc_ids:
                 return 1.0 / (rank + 1)
             elif not doc_id and id(doc) in relevant_doc_ids:

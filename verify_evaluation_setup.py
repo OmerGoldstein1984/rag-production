@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 # Add the project root to the Python path
-project_root = Path(__file__).parent.parent
+project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 def verify_imports():
@@ -51,7 +51,7 @@ def verify_imports():
             chunk_overlap=50,
             use_hybrid=True,
             use_reranker=True,
-            use_rrfTrue,
+            use_rrf=True,
             hybrid_alpha=0.7,
             prompt_version="grounded_v1"
         )

@@ -374,14 +374,16 @@ class RAGEvaluationPipeline:
             # Check if any expected term appears in the document
             if any(term in content_lower for term in expected_terms_lower):
                 # Use metadata doc_id if available, otherwise use index
-                doc_id = doc.get("metadata", {}).get("doc_id", f"doc_{i}")
+                metadata = doc.get("metadata", {})
+                doc_id = metadata.get("doc_id") or metadata.get("filename") or metadata.get("source") or f"doc_{i}"
                 relevant_doc_ids.add(doc_id)
 
         # If no documents matched expected terms but we have results,
         # consider top 3 as relevant for evaluation (to avoid zero scores)
         if not relevant_doc_ids and final_docs:
             for i, doc in enumerate(final_docs[:3]):
-                doc_id = doc.get("metadata", {}).get("doc_id", f"doc_{i}")
+                metadata = doc.get("metadata", {})
+                doc_id = metadata.get("doc_id") or metadata.get("filename") or metadata.get("source") or f"doc_{i}"
                 relevant_doc_ids.add(doc_id)
             logger.debug(f"No expected terms found in retrieved docs for question {question_id}, "
                         f"using top 3 as pseudo-relevant for evaluation")
@@ -802,7 +804,7 @@ class RAGEvaluationPipeline:
             )
 
             # Ingest and index documents
-            data_directory = Path(__file__).parent.parent / "data" / "raw"
+            data_directory = project_root / "data" / "raw"
             pipeline.ingest_and_index_documents(str(data_directory))
 
             # Run evaluation
@@ -997,7 +999,7 @@ def run_comparison_evaluation(golden_set_path: str, output_dir: str) -> None:
         )
 
         # Ingest and index documents
-        data_directory = Path(__file__).parent.parent / "data" / "raw"
+        data_directory = project_root / "data" / "raw"
         pipeline.ingest_and_index_documents(str(data_directory))
 
         # Run evaluation
@@ -1128,11 +1130,11 @@ def main():
         )
 
         # Ingest and index documents
-        data_directory = Path(__file__).parent.parent / args.data_dir
+        data_directory = project_root / args.data_dir
         pipeline.ingest_and_index_documents(str(data_directory))
 
         # Run ablation study
-        golden_set_path = Path(__file__).parent.parent / args.golden_set
+        golden_set_path = project_root / args.golden_set
         ablation_results = pipeline.run_ablation_study(str(golden_set_path), {
             "chunk_strategy": args.chunk_strategy,
             "chunk_size": args.chunk_size,
@@ -1184,7 +1186,7 @@ def main():
 
     elif args.run_comparison:
         logger.info("Running configuration comparison...")
-        golden_set_path = Path(__file__).parent.parent / args.golden_set
+        golden_set_path = project_root / args.golden_set
         run_comparison_evaluation(str(golden_set_path), args.output_dir)
         logger.info(f"Configuration comparison complete. Results saved to {args.output_dir}")
 
@@ -1207,11 +1209,11 @@ def main():
         )
 
         # Ingest and index documents
-        data_directory = Path(__file__).parent.parent / args.data_dir
+        data_directory = project_root / args.data_dir
         pipeline.ingest_and_index_documents(str(data_directory))
 
         # Run evaluation
-        golden_set_path = Path(__file__).parent.parent / args.golden_set
+        golden_set_path = project_root / args.golden_set
         results = pipeline.evaluate_golden_set(str(golden_set_path))
 
         # Save results as markdown

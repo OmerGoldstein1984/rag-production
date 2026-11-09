@@ -85,10 +85,50 @@
         "policyHash": "sha256:00b63b2f746eb8b9095bbd5e1dbae4ddd74fd92a6740b72f59f4069fbfda4737"
       },
       "hash": "sha256:d571820380cb3760b93a6bf98fb5cd3d57fe3279eb7f907ddaa0393191a5f2c0"
+    },
+    {
+      "payload": {
+        "receiptId": "sha256:4eb0e306e7d17aaa979b4d387e810333b056ea1509d7a4d173eab5c15720867a",
+        "previousReceiptHash": "sha256:d571820380cb3760b93a6bf98fb5cd3d57fe3279eb7f907ddaa0393191a5f2c0",
+        "sequence": 2,
+        "issuedAt": 1794233210005,
+        "request": {
+          "identity": {
+            "id": "legacy-cli",
+            "type": "legacy"
+          },
+          "action": {
+            "type": "mcp.tool.call",
+            "resource": "hooks_intelligence_verified-ingest",
+            "tool": "hooks_intelligence_verified-ingest",
+            "server": "ruflo",
+            "network": false,
+            "destructive": false
+          },
+          "context": {
+            "metadata": {
+              "inputDigest": "sha256:b72ed13cb525af2592de7b88e763277fa14592edc468666510c59a8cf02dd505"
+            },
+            "now": 1794233210005
+          },
+          "requestId": "d6dd7ffa-fd8c-4365-9017-58cafa0a54e0"
+        },
+        "decision": {
+          "requestId": "d6dd7ffa-fd8c-4365-9017-58cafa0a54e0",
+          "outcome": "allowed",
+          "enforcedOutcome": "allowed",
+          "mode": "legacy",
+          "reason": "legacy-default-allow",
+          "matchedRules": [],
+          "obligations": []
+        },
+        "policyHash": "sha256:00b63b2f746eb8b9095bbd5e1dbae4ddd74fd92a6740b72f59f4069fbfda4737"
+      },
+      "hash": "sha256:85c5f40e133f391e2624190da2d848652163f7c6742a0f079b532fb526df6642"
     }
   ],
   "migratedAt": 1793466268180,
   "migratedFrom": "pre-ADR-324; capabilities=.swarm/memory.db,agentdb.rvf",
-  "ledgerLength": 2,
-  "ledgerHead": "sha256:d571820380cb3760b93a6bf98fb5cd3d57fe3279eb7f907ddaa0393191a5f2c0"
+  "ledgerLength": 3,
+  "ledgerHead": "sha256:85c5f40e133f391e2624190da2d848652163f7c6742a0f079b532fb526df6642"
 }
