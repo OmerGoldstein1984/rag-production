@@ -1,5 +1,7 @@
 # Teaching Rules for rag-academy RAG System
 
+**Repository:** https://github.com/OmerGoldstein1984/rag-production
+
 This RAG system is designed as a study aid for FDE (Field Development Engineer) interview preparation, specifically focusing on telecom domain knowledge. Follow these rules to ensure the system remains accurate, educational, and aligned with its learning objectives:
 
 ## Core Purpose
