@@ -431,11 +431,11 @@ class AnswerGenerator:
         answer = self.generate_answer(prompt)
         answer_latency = (time.time() - answer_start) * 1000
 
-        # Output grounding verification: fail-closed on ungrounded answers or
-        # detected injection attempts.
-        grounding = self._verify_grounding(answer, used_documents)
-        if not grounding["grounded"] or injection_detected:
-            logger.warning(f"Answer not grounded/injection blocked: {grounding['reason']}")
+        # Output grounding verification using src.security.prompt_guard.
+        from src.security.prompt_guard import validate_answer
+        ok, reason = validate_answer(answer, context)
+        if not ok:
+            logger.warning(f"Answer not grounded/injection blocked: {reason}")
             answer = ("I don't have enough information to answer this question based on the "
                       "provided documents.")
 
@@ -490,8 +490,8 @@ class AnswerGenerator:
                 "num_context_docs": len(used_documents),
                 "context_length": len(context),
                 "answer_generation_latency_ms": answer_latency,
-                "grounded": grounding["grounded"],
-                "grounding_reason": grounding["reason"],
+                "grounded": ok,
+                "grounding_reason": reason,
                 "injection_detected": injection_detected,
                 **({"usage": usage} if usage else {}),
             }

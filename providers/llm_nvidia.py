@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, Type, TypeVar
@@ -145,6 +146,64 @@ class ProviderTimeoutError(ProviderError):
     up to max_retries.
     ALTERNATIVE: Increase timeout instead of retrying (costs latency per call).
     """
+
+
+class CircuitBreaker:
+    """
+    Circuit breaker for LLM provider resilience.
+
+    States:
+      - closed:  normal operation, requests pass through
+      - open:    too many consecutive failures, requests rejected immediately
+      - half_open: cooldown elapsed, one trial request allowed to test recovery
+
+    WHAT: Tracks consecutive failures and trips after failure_threshold, blocking
+        further calls for cooldown_period seconds. After cooldown, enters half_open
+        and allows one trial call; success closes the circuit, failure re-trips it.
+    WHY: Prevents hammering a repeatedly failing upstream (NVIDIA NIM) and gives it
+        time to recover. Protects against thundering herds when many clients recover
+        simultaneously (combined with jittered backoff).
+    INPUTS (__init__): failure_threshold: int (consecutive failures to trip),
+        cooldown_period: float (seconds before half_open trial).
+    OUTPUTS: None (instance).
+    SIDE EFFECTS: Mutates state/failure_count/last_failure_time on each call.
+    FAILURE MODES: None beyond incorrect threshold/cooldown configuration.
+    """
+
+    def __init__(self, failure_threshold: int = 5, cooldown_period: float = 30.0) -> None:
+        self.failure_threshold = failure_threshold
+        self.cooldown_period = cooldown_period
+        self.failure_count = 0
+        self.last_failure_time: Optional[float] = None
+        self.state: str = "closed"  # "closed" | "open" | "half_open"
+
+    def record_success(self) -> None:
+        """Record a successful call: reset failure count and close the circuit."""
+        self.failure_count = 0
+        self.state = "closed"
+        self.last_failure_time = None
+
+    def record_failure(self) -> None:
+        """Record a failed call: increment count and trip if threshold reached."""
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        if self.failure_count >= self.failure_threshold:
+            self.state = "open"
+
+    def can_execute(self) -> bool:
+        """Return True if a call is allowed, False if the circuit is open."""
+        if self.state == "closed":
+            return True
+        if self.state == "open":
+            if self.last_failure_time is not None and (
+                time.time() - self.last_failure_time
+            ) >= self.cooldown_period:
+                self.state = "half_open"
+                return True
+            return False
+        if self.state == "half_open":
+            return True
+        return False
 
 
 @dataclass
@@ -256,6 +315,9 @@ class NVIDIAProvider(LLMProvider):
         max_retries: int = 3,
         backoff_base_s: float = 1.0,
         backoff_max_s: float = 30.0,
+        jitter_max_s: float = 2.0,
+        circuit_breaker_threshold: int = 5,
+        circuit_breaker_cooldown_s: float = 30.0,
         client: Optional[httpx.Client] = None,
         key_pool: Optional[Any] = None,
     ) -> None:
@@ -273,6 +335,11 @@ class NVIDIAProvider(LLMProvider):
         self.max_retries = max_retries
         self.backoff_base_s = backoff_base_s
         self.backoff_max_s = backoff_max_s
+        self.jitter_max_s = jitter_max_s
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=circuit_breaker_threshold,
+            cooldown_period=circuit_breaker_cooldown_s,
+        )
         self._client = client or httpx.Client(timeout=timeout_s)
         self._owns_client = client is None
 
@@ -367,23 +434,22 @@ class NVIDIAProvider(LLMProvider):
 
     def _sleep(self, attempt: int) -> None:
         """
-        Sleep with exponential backoff (capped) before a retry.
+        Sleep with exponential backoff + jitter (capped) before a retry.
 
-        WHAT: Compute delay = min(backoff_base_s * 2**attempt, backoff_max_s)
-        and block with time.sleep.
+        WHAT: Compute delay = min(backoff_base_s * 2**attempt + jitter, backoff_max_s)
+        and block with time.sleep. Jitter is uniform random in [0, jitter_max_s].
         WHY: Exponential backoff reduces load on NVIDIA during transient
-        failures/rate limits; the cap prevents unbounded waits.
+        failures/rate limits; jitter prevents thundering herds when many clients
+        retry simultaneously; the cap prevents unbounded waits.
         INPUTS: attempt: int — the retry attempt index (0-based).
         OUTPUTS: None (blocks the calling thread).
-        SIDE EFFECTS: Blocks the thread (synchronous sleep) — see GAP note below.
+        SIDE EFFECTS: Blocks the thread (synchronous sleep).
         FAILURE MODES: None.
-        ALTERNATIVE: asyncio.sleep for async callers; add jitter to avoid
-        thundering herds.
-        # GAP: Blocking time.sleep in a sync client; if this provider is ever
-        used from an async event loop it blocks the loop. No jitter means
-        retries from many instances can collide (thundering herd).
+        ALTERNATIVE: asyncio.sleep for async callers.
         """
         delay = min(self.backoff_base_s * (2 ** attempt), self.backoff_max_s)
+        jitter = random.uniform(0, self.jitter_max_s)
+        delay = min(delay + jitter, self.backoff_max_s)
         time.sleep(delay)
 
     def _classify_error(self, exc: Exception) -> ProviderError:
@@ -446,6 +512,13 @@ class NVIDIAProvider(LLMProvider):
         rotations = 0
         max_attempts = self.max_retries + (len(self._key_pool.keys) if self._key_pool else 0)
         while attempt <= max_attempts:
+            # Circuit breaker: reject immediately if tripped
+            if not self.circuit_breaker.can_execute():
+                raise ProviderError(
+                    f"NVIDIA circuit breaker is open (failures={self.circuit_breaker.failure_count}, "
+                    f"threshold={self.circuit_breaker.failure_threshold}); "
+                    f"retry after cooldown (~{self.circuit_breaker.cooldown_period}s)"
+                )
             try:
                 resp = self._client.post(self._url(stream=False), headers=self._headers(), json=payload)
                 if resp.status_code in (401, 403) and self._key_pool is not None:
@@ -454,9 +527,11 @@ class NVIDIAProvider(LLMProvider):
                         rotations += 1
                         logger.warning("key %s failed auth; rotating to next key in pool", self._redact_fp())
                         self._api_key = nxt
+                        self.circuit_breaker.record_failure()
                         continue
                     resp.raise_for_status()
                 if resp.status_code == 429 or resp.status_code >= 500:
+                    self.circuit_breaker.record_failure()
                     last_exc = httpx.HTTPStatusError(
                         f"HTTP {resp.status_code}", request=resp.request, response=resp
                     )
@@ -466,8 +541,10 @@ class NVIDIAProvider(LLMProvider):
                         attempt += 1
                         continue
                 resp.raise_for_status()
+                self.circuit_breaker.record_success()
                 return resp
             except httpx.TimeoutException as exc:
+                self.circuit_breaker.record_failure()
                 last_exc = exc
                 if attempt < self.max_retries:
                     logger.warning("NVIDIA timeout, retrying (attempt %d/%d)", attempt + 1, self.max_retries)
@@ -478,13 +555,16 @@ class NVIDIAProvider(LLMProvider):
                 status = exc.response.status_code
                 # Non-retryable statuses raise immediately
                 if status != 429 and status < 500:
+                    self.circuit_breaker.record_failure()
                     raise self._classify_error(exc)
+                self.circuit_breaker.record_failure()
                 last_exc = exc
                 if attempt < self.max_retries:
                     self._sleep(attempt)
                     attempt += 1
                     continue
             except httpx.HTTPError as exc:
+                self.circuit_breaker.record_failure()
                 last_exc = exc
                 if attempt < self.max_retries:
                     self._sleep(attempt)

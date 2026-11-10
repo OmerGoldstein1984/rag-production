@@ -152,6 +152,10 @@ class Settings:
     llm_max_retries: int = 3                         # max retries on transient LLM failure
     llm_retry_backoff_base: float = 1.0              # base backoff seconds
     agent_wall_clock_timeout_s: float = 60.0         # overall agent wall-clock timeout
+    # Circuit breaker (resilience)
+    circuit_breaker_threshold: int = 5               # consecutive failures before tripping
+    circuit_breaker_cooldown_s: float = 30.0         # seconds before trying again (half-open)
+    circuit_breaker_jitter_max_s: float = 2.0        # max jitter seconds added to backoff
 
     @property
     def is_real_provider(self) -> bool:
@@ -274,6 +278,9 @@ def get_settings() -> Settings:
         llm_max_retries=int(os.environ.get("LLM_MAX_RETRIES", "3")),
         llm_retry_backoff_base=float(os.environ.get("LLM_RETRY_BACKOFF_BASE", "1.0")),
         agent_wall_clock_timeout_s=float(os.environ.get("AGENT_WALL_CLOCK_TIMEOUT_S", "60")),
+        circuit_breaker_threshold=int(os.environ.get("CIRCUIT_BREAKER_THRESHOLD", "5")),
+        circuit_breaker_cooldown_s=float(os.environ.get("CIRCUIT_BREAKER_COOLDOWN_S", "30")),
+        circuit_breaker_jitter_max_s=float(os.environ.get("CIRCUIT_BREAKER_JITTER_MAX_S", "2")),
     )
 
 

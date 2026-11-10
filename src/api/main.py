@@ -48,6 +48,7 @@ from src.security.injection import (
     delimit_user_input,
 )
 from src.security.redaction import redact_text
+from src.security.sanitization import sanitize_answer
 from src.security.audit import audit_logger
 import asyncio
 import logging
@@ -152,6 +153,8 @@ class HealthResponse(BaseModel):
     message: str
     vector_store_stats: Dict[str, Any]
     cache_stats: Dict[str, Any]
+    rate_limit_stats: Dict[str, Any] = {}
+    circuit_breaker: Optional[Dict[str, Any]] = None
     version: str
 
 # Simple in-memory cache for repeated queries
@@ -710,11 +713,25 @@ async def health_check():
         cache_stats = query_cache.get_stats()
         rate_limit_stats = rate_limiter.get_stats()
 
+        # Circuit breaker state from LLM provider (if available)
+        cb_state = None
+        prov = rag_pipeline.get("llm_provider")
+        if prov is not None and hasattr(prov, "circuit_breaker"):
+            cb = prov.circuit_breaker
+            cb_state = {
+                "state": cb.state,
+                "failure_count": cb.failure_count,
+                "threshold": cb.failure_threshold,
+                "cooldown_s": cb.cooldown_period,
+            }
+
         return HealthResponse(
             status="healthy",
             message="RAG pipeline is operational",
             vector_store_stats=stats,
             cache_stats=cache_stats,
+            rate_limit_stats=rate_limit_stats,
+            circuit_breaker=cb_state,
             version="2.0.0"
         )
     except Exception as e:
@@ -859,7 +876,7 @@ async def ask_question(
         with trace.stage("llm", provider=rag_pipeline.get("llm_provider", {}).get_model_info().get("provider") if rag_pipeline.get("llm_provider") else "none"):
             answer_result = rag_pipeline["answer_generator"].generate_answer_with_context(
                 request.query, final_docs)
-        answer_text = redact_text(answer_result.answer)
+        answer_text = sanitize_answer(redact_text(answer_result.answer))
         usage = answer_result.metadata.get("usage")
         if usage:
             metrics.add_tokens(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
@@ -879,7 +896,7 @@ async def ask_question(
             sources.append(source_info)
 
         # Format context used: the joined context string sent to the LLM (PII redacted before returning).
-        context_used = redact_text(format_context(final_docs))
+        context_used = sanitize_answer(redact_text(format_context(final_docs)))
 
         # Calculate latency for the full request (retrieve + rerank + llm).
         latency_ms = (time.time() - start_time) * 1000
@@ -988,6 +1005,9 @@ async def ask_stream(
                 for event in gen:
                     if event.get("type") == "done":
                         done = event
+                        event["answer"] = sanitize_answer(event.get("answer", ""))
+                    elif event.get("type") == "token":
+                        event["text"] = sanitize_answer(event.get("text", ""))
                     yield f"data: {_json.dumps(event, default=str)}\n\n"
             record_trace(trace)
             metrics.inc("ask_stream_done")
@@ -1493,7 +1513,9 @@ async def agent_ask(
         )
     metrics.inc("agent_tool_calls", len(result.tool_calls))
     record_trace(trace)
-    return result.to_dict()
+    result_dict = result.to_dict()
+    result_dict["answer"] = sanitize_answer(result_dict.get("answer", ""))
+    return result_dict
 
 
 @app.post("/feedback", response_model=FeedbackResponse)

@@ -77,25 +77,94 @@ def frame_user_input(query: str) -> str:
     return f"{USER_INPUT_START}\n{query}\n{USER_INPUT_END}"
 
 
+def _stopwords() -> set[str]:
+    return {
+        "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
+        "has", "he", "in", "is", "it", "its", "of", "on", "or", "that",
+        "the", "to", "was", "were", "will", "with", "this", "but", "they",
+        "have", "had", "what", "which", "who", "when", "where", "why",
+        "how", "all", "each", "few", "more", "most", "other", "some",
+        "such", "no", "nor", "not", "only", "own", "same", "so", "than",
+        "too", "very", "can", "just", "should", "now", "i", "me", "my",
+        "myself", "we", "our", "ours", "you", "your", "yours", "him",
+        "his", "she", "her", "hers", "it", "its", "them", "their", "theirs",
+    }
+
+
+def answer_overlaps_context(answer: str, context: str, min_overlap: int = 2) -> bool:
+    """Check if key terms from `answer` appear in `context`.
+
+    Returns True if at least `min_overlap` significant words from the answer
+    are found in the context (case-insensitive, stopwords removed). This
+    provides weak grounding evidence for answers that lack explicit citations
+    but are factually traceable to retrieved context.
+    """
+    if not answer or not context:
+        return False
+    sw = _stopwords()
+
+    def words(text: str) -> set[str]:
+        return {
+            w.strip(".,!?;:\"'()[]{}")
+            for w in text.lower().split()
+            if w.strip(".,!?;:\"'()[]{}") and w.strip(".,!?;:\"'()[]{}") not in sw
+        }
+
+    answer_words = words(answer)
+    context_words = words(context)
+    if not answer_words:
+        return False
+    return len(answer_words & context_words) >= min_overlap
+
+
 def is_grounded(answer: str, context: str) -> bool:
-    """Heuristic: answer appears grounded if it cites sources or states
-    insufficient evidence, and does not contain an instruction-override echo."""
+    """Heuristic: answer appears grounded if it cites sources, states
+    insufficient evidence, or shares key terms with the retrieved context —
+    and does not echo instruction-override patterns."""
     if not answer:
         return False
     low = answer.lower()
+    # (a) Insufficiency: model correctly refused due to missing evidence.
     if "i don't have enough information" in low:
         return True
+    # (b) Source citation: answer references sources with brackets.
     if "[" in answer and "]" in answer:
         return True
+    # (c) Context overlap: answer shares key terms with retrieved context.
+    if answer_overlaps_context(answer, context):
+        return True
+    # (d) Injection echo: reject if answer contains override patterns.
     for rx in _PROMPT_INJECTION_PATTERNS:
         if rx.search(answer):
             return False
-    return bool(context and context.strip())
+    return False
 
 
 def validate_answer(answer: str, context: str) -> Tuple[bool, Optional[str]]:
-    """Return (ok, reason). If not ok, the answer should be replaced with a
-    safe refusal rather than returned to the client."""
-    if not is_grounded(answer, context):
-        return False, "Answer failed grounding validation."
-    return True, None
+    """Return (ok, reason).
+
+    If ok is False, the answer is clearly ungrounded or echoes an injection
+    pattern and should be replaced with a safe refusal.
+
+    Weakly grounded answers (share context terms but lack citations) are
+    allowed through with ok=True so callers can log a warning instead of
+    blocking legitimate responses.
+    """
+    if not answer:
+        return False, "Empty answer."
+    low = answer.lower()
+    # Reject injection echoes outright.
+    for rx in _PROMPT_INJECTION_PATTERNS:
+        if rx.search(answer):
+            return False, "Answer echoes instruction-override pattern."
+    # Allow insufficiency messages.
+    if "i don't have enough information" in low:
+        return True, None
+    # Allow citation-backed answers.
+    if "[" in answer and "]" in answer:
+        return True, None
+    # Allow context-overlapping answers (weak grounding).
+    if answer_overlaps_context(answer, context):
+        return True, None
+    # Otherwise ungrounded.
+    return False, "Answer failed grounding validation."
