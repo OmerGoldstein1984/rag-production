@@ -36,6 +36,7 @@ Attack vectors covered
 7. Input validation            (top_k=10000, huge chunk_size, oversized body)
 """
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -135,7 +136,8 @@ def client(monkeypatch):
     monkeypatch.setattr(main, "initialize_rag_pipeline", lambda *a, **k: None)
     monkeypatch.setattr(main, "rag_pipeline", FAKE_PIPELINE)
     # Fresh in-memory rate limiter per test (main.rate_limiter is module-global).
-    monkeypatch.setattr(main, "rate_limiter", main.RateLimiter(max_requests=30, window_seconds=60))
+    # Note: the RateLimiter class is reachable via type(main.rate_limiter).
+    monkeypatch.setattr(main, "rate_limiter", type(main.rate_limiter)(max_requests=30, window_seconds=60))
     with TestClient(main.app) as tc:
         yield tc
 
@@ -208,7 +210,7 @@ class TestAuthZBypass:
         from src.config import get_settings
 
         assert get_settings().api_token == ""  # dev mode
-        assert main.verify_api_token(authorization=None) is None
+        assert asyncio.run(main.verify_api_token(authorization=None)) is None
         info = main.verify_user_role(access_level=3)
         assert info["role"] == "admin"
         assert info["can_ingest"] is True
@@ -221,7 +223,7 @@ class TestAuthZBypass:
 class TestRateLimit:
     def test_rate_limit_returns_429_with_retry_after(self, client, monkeypatch):
         # Stricter limit so the test is fast.
-        monkeypatch.setattr(main, "rate_limiter", main.RateLimiter(max_requests=3, window_seconds=60))
+        monkeypatch.setattr(main, "rate_limiter", type(main.rate_limiter)(max_requests=3, window_seconds=60))
         for _ in range(3):
             r = client.post("/ask", json={"query": "what is remote work?", "top_k": 5})
             assert r.status_code == 200, r.text

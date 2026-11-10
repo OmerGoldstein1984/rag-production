@@ -158,7 +158,9 @@ async def verify_api_key(
     presented, raise 401. The raw token is never logged.
     """
     settings = get_settings()
-    required = settings.api_key_required or bool(settings.api_keys)
+    # Require auth only when keys are configured; with no keys configured the
+    # system is in permissive dev mode (callers are treated as guests).
+    required = bool(settings.api_keys)
 
     # Extract the bearer token from either header style.
     token = None

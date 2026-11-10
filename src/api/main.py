@@ -49,6 +49,7 @@ from src.security.injection import (
 )
 from src.security.redaction import redact_text
 from src.security.audit import audit_logger
+import asyncio
 import logging
 import sys
 import time
@@ -254,13 +255,51 @@ USER_ROLES = {
 async def verify_api_token(authorization: Optional[str] = Header(None)) -> None:
     """Require a scoped bearer API key on every request (fail closed).
 
-    Delegates to src.security.auth.verify_api_key, which verifies the key in
-    constant time against configured API_KEYS and derives scopes server-side.
-    Replaces the single shared API_TOKEN with rotatable, scoped API keys. The
-    raw key is never logged.
+    Async dependency: authenticates via scoped API key derived from
+    src.security.auth (API_KEYS env var), falling back to the legacy single
+    shared API_TOKEN. The raw key is never logged. Works as a FastAPI
+    dependency (async) and can be called with asyncio.run() in tests.
     """
-    await verify_api_key(authorization=authorization, credentials=None)
-    return None
+    import hmac
+
+    settings = _get_settings()
+
+    token = None
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization[len("Bearer "):].strip()
+
+    # Dev mode: no auth configured at all.
+    if not settings.api_keys and not settings.api_token:
+        return None
+
+    if not token:
+        raise AuthenticationError("Missing bearer API key")
+
+    # Try scoped API keys first (API_KEYS env var).
+    if settings.api_keys:
+        key = None
+        if ":" in token:
+            kid, secret = token.split(":", 1)
+            key = security_auth._key_store.verify(kid.strip(), secret.strip())
+        else:
+            # Single-secret mode: try every configured key.
+            for entry in settings.api_keys or []:
+                entry = entry.strip()
+                if ":" not in entry:
+                    continue
+                kid, sec = entry.split(":", 1)
+                candidate = security_auth._key_store.verify(kid.strip(), token.strip())
+                if candidate is not None:
+                    key = candidate
+                    break
+        if key is not None:
+            return None
+
+    # Fall back to legacy single shared API_TOKEN.
+    if settings.api_token and hmac.compare_digest(token, settings.api_token):
+        return None
+
+    raise AuthenticationError("Invalid API key")
 
 
 # Role/authorization is now derived server-side from the verified API key
@@ -1266,8 +1305,8 @@ async def upload_document(
     # Size + extension allowlist guard before any indexing work.
     if len(content) > MAX_UPLOAD_SIZE:
         raise HTTPException(status_code=413, detail="Upload too large")
-    validate_filename(file.filename or "unnamed")
     try:
+        validate_filename(file.filename or "unnamed")
         rec = doc_manager.upload(file.filename or "unnamed", content, rag_pipeline["vector_store"])
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

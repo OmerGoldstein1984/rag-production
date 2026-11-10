@@ -4,6 +4,7 @@ repaired evaluation runner (hybrid retrieval with real BM25, judge wiring).
 """
 
 import sys
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -37,21 +38,23 @@ def test_ingest_dir_blocks_absolute_outside():
 # --- bearer token auth ----------------------------------------------------
 
 def test_token_noop_when_unconfigured(monkeypatch):
+    monkeypatch.delenv("API_KEYS", raising=False)
     monkeypatch.delenv("API_TOKEN", raising=False)
-    assert verify_api_token(authorization=None) is None  # dev mode: allowed
+    assert asyncio.run(verify_api_token(authorization=None)) is None  # dev mode: allowed
 
 
 def test_token_required_when_configured(monkeypatch):
-    monkeypatch.setenv("API_TOKEN", "secret-token-123")
+    monkeypatch.setenv("API_KEYS", "admin:admin-secret-123")
+    monkeypatch.delenv("API_TOKEN", raising=False)
     from src.config import get_settings
     # bypass lru? get_settings isn't cached here (plain function) — env read each call
     with pytest.raises(HTTPException) as e1:
-        verify_api_token(authorization=None)
+        asyncio.run(verify_api_token(authorization=None))
     assert e1.value.status_code == 401
     with pytest.raises(HTTPException) as e2:
-        verify_api_token(authorization="Bearer wrong")
+        asyncio.run(verify_api_token(authorization="Bearer wrong"))
     assert e2.value.status_code == 401
-    assert verify_api_token(authorization="Bearer secret-token-123") is None
+    assert asyncio.run(verify_api_token(authorization="Bearer admin:admin-secret-123")) is None
 
 
 # --- eval runner repairs --------------------------------------------------

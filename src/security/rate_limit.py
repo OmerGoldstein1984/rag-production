@@ -76,7 +76,10 @@ class RateLimiter:
     # --- rule selection ------------------------------------------------------
 
     def _rule_for(self, endpoint: str) -> LimitRule:
-        return self.rules.get(endpoint, self.rules["_default"])
+        rule = self.rules.get(endpoint)
+        if rule is None:
+            rule = self.rules.get("_default")
+        return rule or LimitRule(max_requests=30, window_seconds=60)
 
     # --- in-memory backend ---------------------------------------------------
 
