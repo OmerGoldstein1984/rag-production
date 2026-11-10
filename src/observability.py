@@ -496,6 +496,83 @@ def get_recent_traces(limit: int = 20) -> List[Dict[str, Any]]:
         return list(_traces[-limit:])
 
 
+# --- persistent observability --------------------------------------------------
+
+# Persistent storage paths (loaded lazily from settings).
+_metrics_path: str = "data/metrics.json"
+_traces_path: str = "data/traces.jsonl"
+
+
+def _configure_storage_paths() -> None:
+    """Read storage paths from settings if available."""
+    global _metrics_path, _traces_path
+    try:
+        settings = get_settings()
+        _metrics_path = settings.metrics_storage_path
+        _traces_path = settings.traces_storage_path
+    except Exception:
+        pass  # settings not configured yet; use defaults
+
+
+def flush_metrics() -> None:
+    """Persist current metrics snapshot to disk as JSON."""
+    _configure_storage_paths()
+    data = {
+        "counters": dict(metrics.counters),
+        "latency": {name: list(v) for name, v in metrics.latency_ms.items()},
+        "tokens": dict(metrics.tokens),
+        "errors": dict(metrics.errors),
+    }
+    try:
+        with open(_metrics_path, "w") as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        pass  # best-effort persistence
+
+
+def load_persistent_metrics() -> None:
+    """Load metrics from disk and merge into current metrics."""
+    _configure_storage_paths()
+    try:
+        with open(_metrics_path, "r") as f:
+            data = json.load(f)
+        with metrics._lock:
+            metrics.counters.update(data.get("counters", {}))
+            for name, values in data.get("latency", {}).items():
+                metrics.latency_ms.setdefault(name, []).extend(values)
+            metrics.tokens.update(data.get("tokens", {}))
+            metrics.errors.update(data.get("errors", {}))
+    except (OSError, json.JSONDecodeError):
+        pass  # no existing metrics file; start fresh
+
+
+def persistent_record_trace(trace: Trace) -> None:
+    """Append a completed trace to the persistent JSONL file."""
+    _configure_storage_paths()
+    try:
+        with open(_traces_path, "a") as f:
+            f.write(json.dumps(trace.to_dict()) + "\n")
+    except OSError:
+        pass  # best-effort persistence
+
+
+def get_persistent_traces(limit: int = 20) -> List[Dict[str, Any]]:
+    """Return the most recent `limit` traces from the persistent JSONL file."""
+    _configure_storage_paths()
+    try:
+        with open(_traces_path, "r") as f:
+            lines = f.readlines()
+        traces = []
+        for line in lines[-limit:]:
+            line = line.strip()
+            if line:
+                traces.append(json.loads(line))
+        return traces
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+
 # --- security audit logging --------------------------------------------------
 
 @dataclass

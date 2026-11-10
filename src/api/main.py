@@ -50,6 +50,11 @@ from src.security.injection import (
 from src.security.redaction import redact_text
 from src.security.sanitization import sanitize_answer
 from src.security.audit import audit_logger
+from src.security.jwt_auth import (
+    create_access_token,
+    verify_access_token,
+    get_current_user_from_token,
+)
 import asyncio
 import logging
 import sys
@@ -91,6 +96,9 @@ from src.security.prompt_guard import (  # noqa: E402
     PromptInjectionBlocked, sanitize_user_input, frame_user_input, validate_answer,
 )
 from src.security.redaction import redact_pii, redact_dict  # noqa: E402
+from src.observability import (  # noqa: E402
+    load_persistent_metrics, flush_metrics, persistent_record_trace, get_persistent_traces,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -256,12 +264,12 @@ USER_ROLES = {
 
 
 async def verify_api_token(authorization: Optional[str] = Header(None)) -> None:
-    """Require a scoped bearer API key on every request (fail closed).
+    """Require a scoped bearer API key or JWT on every request (fail closed).
 
     Async dependency: authenticates via scoped API key derived from
     src.security.auth (API_KEYS env var), falling back to the legacy single
-    shared API_TOKEN. The raw key is never logged. Works as a FastAPI
-    dependency (async) and can be called with asyncio.run() in tests.
+    shared API_TOKEN, or a JWT access token. Works as a FastAPI dependency
+    (async) and can be called with asyncio.run() in tests.
     """
     import hmac
 
@@ -302,7 +310,15 @@ async def verify_api_token(authorization: Optional[str] = Header(None)) -> None:
     if settings.api_token and hmac.compare_digest(token, settings.api_token):
         return None
 
-    raise AuthenticationError("Invalid API key")
+    # Try JWT access token.
+    try:
+        jwt_key = security_auth.verify_jwt_token(token)
+        if jwt_key is not None:
+            return None
+    except Exception:
+        pass
+
+    raise AuthenticationError("Invalid API token")
 
 
 # Role/authorization is now derived server-side from the verified API key
@@ -511,6 +527,7 @@ async def log_requests(request: Request, call_next):
         metrics.inc_error(type(e).__name__)
         trace.error = str(e)
         record_trace(trace)
+        persistent_record_trace(trace)
         raise
 
     process_ms = (time.time() - start_time) * 1000.0
@@ -521,6 +538,7 @@ async def log_requests(request: Request, call_next):
     logger.info(f"request done {request.method} {request.url.path} "
                 f"status={response.status_code} ms={process_ms:.1f}")
     record_trace(trace)
+    persistent_record_trace(trace)
     return response
 
 
@@ -596,6 +614,7 @@ async def startup_event():
     setup_logging(level=get_settings().log_level, structured=True)
     logger.info("structured JSON logging enabled")
     initialize_rag_pipeline()
+    load_persistent_metrics()
 
 
 @app.get("/metrics")
@@ -1516,6 +1535,55 @@ async def agent_ask(
     result_dict = result.to_dict()
     result_dict["answer"] = sanitize_answer(result_dict.get("answer", ""))
     return result_dict
+
+
+class TokenRequest(BaseModel):
+    key_id: str
+    secret: str
+
+
+@app.post("/auth/token")
+async def create_token(request: TokenRequest):
+    """Authenticate with API key credentials and receive a JWT access token.
+
+    Accepts key_id:secret credentials and returns a short-lived JWT access token
+    plus a longer-lived refresh token. The access token can be used as a Bearer
+    token on subsequent requests instead of the raw API key.
+    """
+    key = security_auth._key_store.verify(request.key_id, request.secret)
+    if key is None:
+        raise AuthenticationError("Invalid API key")
+    access_token = create_access_token({"sub": key.key_id, "scopes": key.scopes})
+    refresh_token = create_access_token({"sub": key.key_id, "scopes": key.scopes, "typ": "refresh"})
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "expires_in": _get_settings().jwt_access_token_expire_minutes * 60,
+    }
+
+
+@app.post("/auth/refresh")
+async def refresh_token(authorization: Optional[str] = Header(None)):
+    """Refresh an access token using a refresh JWT."""
+    token = None
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization[len("Bearer "):].strip()
+    if not token:
+        raise AuthenticationError("Missing refresh token")
+    payload = verify_access_token(token)
+    if payload is None:
+        raise AuthenticationError("Invalid or expired refresh token")
+    key_id = payload.get("sub")
+    scopes = payload.get("scopes", [])
+    if not key_id or not isinstance(scopes, list):
+        raise AuthenticationError("Invalid refresh token")
+    new_access_token = create_access_token({"sub": key_id, "scopes": scopes})
+    return {
+        "access_token": new_access_token,
+        "token_type": "bearer",
+        "expires_in": _get_settings().jwt_access_token_expire_minutes * 60,
+    }
 
 
 @app.post("/feedback", response_model=FeedbackResponse)

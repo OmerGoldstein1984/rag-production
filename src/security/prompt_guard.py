@@ -91,7 +91,7 @@ def _stopwords() -> set[str]:
     }
 
 
-def answer_overlaps_context(answer: str, context: str, min_overlap: int = 2) -> bool:
+def answer_overlaps_context(answer: str, context: str, min_overlap: int = 1) -> bool:
     """Check if key terms from `answer` appear in `context`.
 
     Returns True if at least `min_overlap` significant words from the answer
@@ -115,6 +115,59 @@ def answer_overlaps_context(answer: str, context: str, min_overlap: int = 2) -> 
     if not answer_words:
         return False
     return len(answer_words & context_words) >= min_overlap
+
+
+def get_grounding_confidence(answer: str, context: str) -> float:
+    """Return a confidence score (0.0 to 1.0) for how grounded an answer is.
+
+    Scoring:
+      - 1.0 if answer states insufficient evidence (honest refusal)
+      - 0.9 if answer contains source citations [..]
+      - 0.7 if >50% of answer words appear in context (high overlap)
+      - 0.4 if >=1 answer word appears in context (low overlap)
+      - 0.1 if answer has non-stopword words but none match context
+      - 0.0 if answer echoes injection patterns or is empty
+    """
+    if not answer or not context:
+        return 0.0
+    low = answer.lower()
+
+    # (a) Insufficiency is honest — highest confidence
+    if "i don't have enough information" in low:
+        return 1.0
+
+    # (b) Injection echo — never trust
+    for rx in _PROMPT_INJECTION_PATTERNS:
+        if rx.search(answer):
+            return 0.0
+
+    # (c) Citation-backed — high confidence
+    if "[" in answer and "]" in answer:
+        return 0.9
+
+    # (d) Word overlap with context
+    sw = _stopwords()
+
+    def words(text: str) -> set[str]:
+        return {
+            w.strip(".,!?;:\"'()[]{}")
+            for w in text.lower().split()
+            if w.strip(".,!?;:\"'()[]{}") and w.strip(".,!?;:\"'()[]{}") not in sw
+        }
+
+    answer_words = words(answer)
+    context_words = words(context)
+    if not answer_words:
+        return 0.0
+
+    overlap = len(answer_words & context_words)
+    overlap_ratio = overlap / len(answer_words)
+
+    if overlap_ratio > 0.5:
+        return 0.7  # high overlap
+    if overlap >= 1:
+        return 0.4  # some overlap
+    return 0.1  # no overlap but non-empty
 
 
 def is_grounded(answer: str, context: str) -> bool:
@@ -149,6 +202,10 @@ def validate_answer(answer: str, context: str) -> Tuple[bool, Optional[str]]:
     Weakly grounded answers (share context terms but lack citations) are
     allowed through with ok=True so callers can log a warning instead of
     blocking legitimate responses.
+
+    Confidence threshold: answers with grounding confidence >= 0.3 are allowed.
+    Only answers with confidence < 0.3 (no meaningful context overlap) are
+    blocked.
     """
     if not answer:
         return False, "Empty answer."
@@ -163,8 +220,9 @@ def validate_answer(answer: str, context: str) -> Tuple[bool, Optional[str]]:
     # Allow citation-backed answers.
     if "[" in answer and "]" in answer:
         return True, None
-    # Allow context-overlapping answers (weak grounding).
-    if answer_overlaps_context(answer, context):
+    # Allow context-overlapping answers (weak grounding) if confidence >= 0.3
+    confidence = get_grounding_confidence(answer, context)
+    if confidence >= 0.3:
         return True, None
-    # Otherwise ungrounded.
+    # Otherwise ungrounded — confidence too low
     return False, "Answer failed grounding validation."

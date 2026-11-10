@@ -125,6 +125,8 @@ class Settings:
     jwt_secret: str = ""
     jwt_algorithm: str = "HS256"
     jwt_expiry_seconds: int = 900
+    jwt_access_token_expire_minutes: int = 30
+    jwt_refresh_token_expire_days: int = 7
     # Rate limiting
     rate_limit_enabled: bool = True                  # enable rate limiting
     rate_limit_backend: str = "memory"               # "memory" or "redis"
@@ -156,6 +158,9 @@ class Settings:
     circuit_breaker_threshold: int = 5               # consecutive failures before tripping
     circuit_breaker_cooldown_s: float = 30.0         # seconds before trying again (half-open)
     circuit_breaker_jitter_max_s: float = 2.0        # max jitter seconds added to backoff
+    # Persistent observability storage
+    metrics_storage_path: str = "data/metrics.json"  # path to metrics persistence file
+    traces_storage_path: str = "data/traces.jsonl"   # path to traces persistence file
 
     @property
     def is_real_provider(self) -> bool:
@@ -281,6 +286,10 @@ def get_settings() -> Settings:
         circuit_breaker_threshold=int(os.environ.get("CIRCUIT_BREAKER_THRESHOLD", "5")),
         circuit_breaker_cooldown_s=float(os.environ.get("CIRCUIT_BREAKER_COOLDOWN_S", "30")),
         circuit_breaker_jitter_max_s=float(os.environ.get("CIRCUIT_BREAKER_JITTER_MAX_S", "2")),
+        jwt_refresh_token_expire_days=int(os.environ.get("JWT_REFRESH_TOKEN_EXPIRE_DAYS", "7")),
+        # Persistent observability storage
+        metrics_storage_path=os.environ.get("METRICS_STORAGE_PATH", "data/metrics.json"),
+        traces_storage_path=os.environ.get("TRACES_STORAGE_PATH", "data/traces.jsonl"),
     )
 
 
