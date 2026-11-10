@@ -59,6 +59,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from src.security.redaction import redact_dict, redact_text as redact_pii
+
 # --- correlation id -------------------------------------------------------
 
 # ContextVar holding the current request (correlation) ID for the lifetime of a
@@ -150,6 +152,8 @@ def redact(text: Any) -> str:
     s = text if isinstance(text, str) else json.dumps(text, default=str)
     for rx in _SECRET_PATTERNS:
         s = rx.sub("[REDACTED]", s)
+    # Also scrub PII (emails, phones, IMSI/IMEI, customer IDs, IP addresses).
+    s = redact_pii(s)
     return s
 
 
@@ -349,7 +353,7 @@ class Trace:
             "total_ms": round(self.total_ms, 2),
             "error": self.error,
             "stages": [
-                {"stage": s.stage, "duration_ms": round(s.duration_ms, 2), **s.detail}
+                {"stage": s.stage, "duration_ms": round(s.duration_ms, 2), **redact_dict(s.detail)}
                 for s in self.spans
             ],
         }
@@ -490,3 +494,149 @@ def get_recent_traces(limit: int = 20) -> List[Dict[str, Any]]:
     """Return the most recent `limit` traces as dicts (newest last)."""
     with _trace_lock:
         return list(_traces[-limit:])
+
+
+# --- persistent observability --------------------------------------------------
+
+# Persistent storage paths (loaded lazily from settings).
+_metrics_path: str = "data/metrics.json"
+_traces_path: str = "data/traces.jsonl"
+
+
+def _configure_storage_paths() -> None:
+    """Read storage paths from settings if available."""
+    global _metrics_path, _traces_path
+    try:
+        settings = get_settings()
+        _metrics_path = settings.metrics_storage_path
+        _traces_path = settings.traces_storage_path
+    except Exception:
+        pass  # settings not configured yet; use defaults
+
+
+def flush_metrics() -> None:
+    """Persist current metrics snapshot to disk as JSON."""
+    _configure_storage_paths()
+    data = {
+        "counters": dict(metrics.counters),
+        "latency": {name: list(v) for name, v in metrics.latency_ms.items()},
+        "tokens": dict(metrics.tokens),
+        "errors": dict(metrics.errors),
+    }
+    try:
+        with open(_metrics_path, "w") as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        pass  # best-effort persistence
+
+
+def load_persistent_metrics() -> None:
+    """Load metrics from disk and merge into current metrics."""
+    _configure_storage_paths()
+    try:
+        with open(_metrics_path, "r") as f:
+            data = json.load(f)
+        with metrics._lock:
+            metrics.counters.update(data.get("counters", {}))
+            for name, values in data.get("latency", {}).items():
+                metrics.latency_ms.setdefault(name, []).extend(values)
+            metrics.tokens.update(data.get("tokens", {}))
+            metrics.errors.update(data.get("errors", {}))
+    except (OSError, json.JSONDecodeError):
+        pass  # no existing metrics file; start fresh
+
+
+def persistent_record_trace(trace: Trace) -> None:
+    """Append a completed trace to the persistent JSONL file."""
+    _configure_storage_paths()
+    try:
+        with open(_traces_path, "a") as f:
+            f.write(json.dumps(trace.to_dict()) + "\n")
+    except OSError:
+        pass  # best-effort persistence
+
+
+def get_persistent_traces(limit: int = 20) -> List[Dict[str, Any]]:
+    """Return the most recent `limit` traces from the persistent JSONL file."""
+    _configure_storage_paths()
+    try:
+        with open(_traces_path, "r") as f:
+            lines = f.readlines()
+        traces = []
+        for line in lines[-limit:]:
+            line = line.strip()
+            if line:
+                traces.append(json.loads(line))
+        return traces
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+
+# --- security audit logging --------------------------------------------------
+
+@dataclass
+class AuditEvent:
+    """One security-relevant event: who did what, when, where, with what outcome."""
+
+    timestamp: float
+    actor: str            # client_id / key_id / role
+    action: str           # e.g. "auth_failure", "rate_limit_block", "ingest", "delete"
+    endpoint: str         # e.g. "/ask", "/ingest"
+    detail: Dict[str, Any]  # redacted context (query hash, tool, etc.)
+    outcome: str          # "allowed", "blocked", "error"
+
+
+class AuditLogger:
+    """Bounded ring buffer of security audit events."""
+
+    def __init__(self, limit: int = 1000):
+        self.limit = limit
+        self.events: List[AuditEvent] = []
+        self._lock = threading.Lock()
+
+    def log(self, actor: str, action: str, endpoint: str,
+            detail: Optional[Dict[str, Any]] = None, outcome: str = "allowed") -> None:
+        event = AuditEvent(
+            timestamp=time.time(),
+            actor=actor,
+            action=action,
+            endpoint=endpoint,
+            detail=redact_dict(detail or {}),
+            outcome=outcome,
+        )
+        with self._lock:
+            self.events.append(event)
+            if len(self.events) > self.limit:
+                del self.events[: len(self.events) - self.limit]
+
+    def snapshot(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [
+                {
+                    "timestamp": round(e.timestamp, 3),
+                    "actor": e.actor,
+                    "action": e.action,
+                    "endpoint": e.endpoint,
+                    "detail": e.detail,
+                    "outcome": e.outcome,
+                }
+                for e in self.events
+            ]
+
+
+# Global audit logger (imported by src/api/main.py).
+audit_logger = AuditLogger()
+
+
+def log_security_event(actor: str, action: str, endpoint: str,
+                       detail: Optional[Dict[str, Any]] = None,
+                       outcome: str = "allowed") -> None:
+    """Record a security-relevant event (auth failure, rate-limit block, ingest,
+    delete, prompt-injection block, PII redaction)."""
+    audit_logger.log(actor, action, endpoint, detail, outcome)
+
+
+def get_recent_audit_events(limit: int = 100) -> List[Dict[str, Any]]:
+    """Return the most recent `limit` audit events."""
+    return audit_logger.snapshot()[-limit:]

@@ -5,12 +5,80 @@ Answer generation utilities for RAG systems.
 from typing import List, Dict, Any, Optional, Tuple
 import logging
 import re
+import random
 import time
 from dataclasses import dataclass, asdict
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
 
 from pydantic import BaseModel, Field
 
+# Prompt-injection defense: sanitize user queries before they enter the prompt.
+# prompt_guard is the canonical module (fail-closed: raises on injection).
+from src.security.prompt_guard import sanitize_user_input, PromptInjectionBlocked  # noqa: E402
+
 logger = logging.getLogger(__name__)
+
+# Canned insufficiency messages the grounded prompt instructs the LLM to emit when
+# evidence is missing. Answers that are neither these nor source-cited are treated
+# as ungrounded and flagged.
+INSUFFICIENCY_MESSAGES = (
+    "I don't have enough information to answer this question based on the provided documents.",
+    "I don't have sufficient information in the provided context to answer this question accurately.",
+)
+
+
+class CircuitBreaker:
+    """Circuit breaker for the LLM provider.
+
+    WHAT: Tracks consecutive failures and, once a threshold is reached, opens the
+    circuit so subsequent calls fail fast without hitting the provider. After a
+    cooldown it enters half-open state and allows a single trial call.
+    WHY: A flaky or overloaded LLM provider should not drain the retry budget or
+    block every request indefinitely; failing fast protects latency and cost.
+    STATES: closed (calls allowed), open (calls rejected fast), half_open
+        (single trial call after cooldown).
+    """
+
+    def __init__(
+        self,
+        failure_threshold: int = 3,
+        recovery_timeout_s: float = 30.0,
+        half_open_max_calls: int = 1,
+    ):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout_s = recovery_timeout_s
+        self.half_open_max_calls = half_open_max_calls
+        self.failures = 0
+        self.state: str = "closed"  # closed | open | half_open
+        self.last_failure_time: Optional[float] = None
+        self.half_open_calls = 0
+
+    def allow_request(self) -> bool:
+        """Return True if a call may be attempted right now."""
+        now = time.time()
+        if self.state == "open":
+            if self.last_failure_time is not None and (
+                now - self.last_failure_time >= self.recovery_timeout_s
+            ):
+                self.state = "half_open"
+                self.half_open_calls = 0
+                return True
+            return False
+        if self.state == "half_open":
+            return self.half_open_calls < self.half_open_max_calls
+        return True  # closed
+
+    def record_success(self) -> None:
+        self.failures = 0
+        self.state = "closed"
+        self.half_open_calls = 0
+
+    def record_failure(self) -> None:
+        self.failures += 1
+        self.last_failure_time = time.time()
+        if self.state == "half_open" or self.failures >= self.failure_threshold:
+            self.state = "open"
+
 
 @dataclass
 class GenerationResult:
@@ -76,6 +144,13 @@ class AnswerGenerator:
 
         # Token estimation constants (rough approximations)
         self.chars_per_token = 4.0  # Average for English text
+
+        # Resilience: circuit breaker, retry + backoff, per-call timeout.
+        self.circuit_breaker = CircuitBreaker()
+        self.max_retries = 3
+        self.base_backoff_s = 1.0
+        self.request_timeout_s = 60.0
+        self._executor = ThreadPoolExecutor(max_workers=1)
 
     def _load_model(self):
         """
@@ -206,13 +281,95 @@ class AnswerGenerator:
         must stay available.
         """
         if self.llm_provider is not None:
-            try:
-                return self.llm_provider.generate(prompt)
-            except Exception as e:
-                logger.error(f"LLM provider failed, returning insufficient-evidence fallback: {e}")
-                return ("I don't have enough information to answer this question based on the "
-                        "provided documents. (LLM provider error)")
+            last_error = None
+            for attempt in range(self.max_retries + 1):
+                if not self.circuit_breaker.allow_request():
+                    logger.warning("LLM provider circuit breaker is open; refusing call")
+                    return (
+                        "I don't have enough information to answer this question based on the "
+                        "provided documents. (LLM provider unavailable)"
+                    )
+                try:
+                    return self._call_with_timeout(prompt)
+                except Exception as e:
+                    last_error = e
+                    self.circuit_breaker.record_failure()
+                    if attempt < self.max_retries:
+                        sleep_for = self.base_backoff_s * (2**attempt) + random.uniform(0, 0.5)
+                        logger.warning(
+                            f"LLM call failed (attempt {attempt + 1}/{self.max_retries + 1}): {e}; "
+                            f"retrying in {sleep_for:.2f}s"
+                        )
+                        time.sleep(sleep_for)
+            logger.error(
+                f"LLM provider failed after {self.max_retries + 1} attempts, returning fallback: {last_error}"
+            )
+            return (
+                "I don't have enough information to answer this question based on the "
+                "provided documents. (LLM provider error)"
+            )
         return self._mock_generate(prompt)
+
+    def _call_with_timeout(self, prompt: str) -> str:
+        """Call the provider under a per-request timeout.
+
+        WHAT: Submit the blocking provider.generate() to a single-thread executor
+        and wait with a hard timeout.
+        WHY: A slow or hung provider must not block the API handler indefinitely.
+        """
+        fut = self._executor.submit(self.llm_provider.generate, prompt)
+        try:
+            return fut.result(timeout=self.request_timeout_s)
+        except FutTimeout:
+            self.circuit_breaker.record_failure()
+            raise TimeoutError(
+                f"LLM provider call timed out after {self.request_timeout_s}s"
+            )
+
+    def _verify_grounding(self,
+                          answer: str,
+                          used_documents: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Verify that the generated answer is grounded in retrieved context.
+
+        WHAT: Heuristically checks whether the answer either (a) states insufficient
+        evidence (a canned refusal) or (b) cites at least one source filename drawn
+        from the retrieved documents. Returns a dict with `grounded` (bool) and
+        `reason` (str).
+        WHY: Prompt injection can trick the model into emitting ungrounded claims or
+        leaking instructions; this is a last-line output filter that flags answers
+        not traceable to the source corpus so callers can downgrade or block them.
+        INPUTS: answer: str — the generated answer text;
+            used_documents: List[Dict] — the retrieved docs used as context.
+        OUTPUTS: dict {"grounded": bool, "reason": str}.
+        FAILURE MODES: Never raises; defaults to grounded=False with a reason when
+        the check cannot be completed.
+        """
+        result = {"grounded": False, "reason": "no source citation or insufficiency message found"}
+        if not answer:
+            return result
+
+        # (a) Insufficiency: the model correctly refused due to missing evidence.
+        for msg in INSUFFICIENCY_MESSAGES:
+            if msg in answer:
+                return {"grounded": True, "reason": "insufficiency message (no evidence)"}
+
+        # (b) Source citation: answer references a source drawn from context.
+        cited_sources = set()
+        for doc in used_documents:
+            metadata = doc.get("metadata", {})
+            source = metadata.get("source", "")
+            source_filename = source.split("/")[-1].split("\\")[-1] if source else ""
+            if source_filename and source_filename in answer:
+                cited_sources.add(source_filename)
+            # Also match bracketed citation styles like [source_filename] or [Source: file]
+            if source_filename and f"[{source_filename}]" in answer:
+                cited_sources.add(source_filename)
+
+        if cited_sources:
+            return {"grounded": True, "reason": f"cited sources: {sorted(cited_sources)}"}
+
+        return result
 
     def generate_answer_with_context(self,
                                      query: str,
@@ -247,13 +404,22 @@ class AnswerGenerator:
         """
         start_time = time.time()
 
+        # Prompt-injection defense: fail-closed on instruction-override / jailbreak.
+        injection_detected = False
+        try:
+            safe_query = sanitize_user_input(query)
+        except PromptInjectionBlocked:
+            injection_detected = True
+            logger.warning("Prompt injection blocked in user query")
+            safe_query = ""
+
         # Build context within token budget
         context, used_documents, token_stats = self._build_context_within_budget(
             context_documents, max_context_tokens)
 
-        # Create grounded prompt
+        # Create grounded prompt (user input is delimiter-framed in prompt.py)
         from .prompt import create_grounded_prompt
-        prompt = create_grounded_prompt(context, query, "v2")
+        prompt = create_grounded_prompt(context, safe_query, "v2")
 
         # Estimate prompt tokens
         prompt_tokens = self._estimate_tokens(prompt)
@@ -264,6 +430,14 @@ class AnswerGenerator:
         answer_start = time.time()
         answer = self.generate_answer(prompt)
         answer_latency = (time.time() - answer_start) * 1000
+
+        # Output grounding verification using src.security.prompt_guard.
+        from src.security.prompt_guard import validate_answer
+        ok, reason = validate_answer(answer, context)
+        if not ok:
+            logger.warning(f"Answer not grounded/injection blocked: {reason}")
+            answer = ("I don't have enough information to answer this question based on the "
+                      "provided documents.")
 
         # Capture provider-reported usage when available (real providers only)
         provider_info: Dict[str, Any] = {"provider": "mock", "model": self.model_name}
@@ -316,6 +490,9 @@ class AnswerGenerator:
                 "num_context_docs": len(used_documents),
                 "context_length": len(context),
                 "answer_generation_latency_ms": answer_latency,
+                "grounded": ok,
+                "grounding_reason": reason,
+                "injection_detected": injection_detected,
                 **({"usage": usage} if usage else {}),
             }
         )
@@ -358,10 +535,18 @@ class AnswerGenerator:
         metrics inconsistently.
         """
         import json as _json
+        # Prompt-injection defense: fail-closed on instruction-override / jailbreak.
+        injection_detected = False
+        try:
+            safe_query = sanitize_user_input(query)
+        except PromptInjectionBlocked:
+            injection_detected = True
+            logger.warning("Prompt injection blocked in streamed user query")
+            safe_query = ""
         context, used_documents, token_stats = self._build_context_within_budget(
             context_documents, max_context_tokens)
         from .prompt import create_grounded_prompt
-        prompt = create_grounded_prompt(context, query, "v2")
+        prompt = create_grounded_prompt(context, safe_query, "v2")
         prompt_tokens = self._estimate_tokens(prompt)
         token_stats["prompt_tokens"] = prompt_tokens
 

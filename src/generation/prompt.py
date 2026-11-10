@@ -37,6 +37,10 @@ from typing import List, Dict, Any, Optional
 import logging
 import re
 
+# Prompt-injection defense: delimiter framing separates trusted system
+# instructions from untrusted user input inside the rendered prompt.
+from src.security.prompt_guard import sanitize_user_input, frame_user_input  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
 
@@ -208,8 +212,12 @@ class PromptEngineer:
         registered (a misspelled name won't raise).
         ALTERNATIVE: Require the caller to pass the template object directly.
         """
+        # Prompt injection defense: sanitize + frame untrusted user input so it
+        # cannot be confused with trusted system instructions.
+        safe_query = sanitize_user_input(query)
+        framed_query = frame_user_input(safe_query)
         template = self.templates.get(template_name, self.templates["grounded_v2"])
-        return template.format(context, query)
+        return template.format(context, framed_query)
 
     def create_prompt_from_template(self,
                                     template_str: str,
@@ -370,7 +378,10 @@ def create_grounded_prompt(context: str, query: str, version: str = "v2") -> str
     """
     template_name = f"grounded_{version}"
     engineer = PromptEngineer()
-    return engineer.create_prompt(context, query, template_name)
+    # Delimiter framing: wrap the untrusted user query so the LLM can visually
+    # distinguish trusted system instructions (the template) from user content.
+    framed_query = frame_user_input(query)
+    return engineer.create_prompt(context, framed_query, template_name)
 
 
 def create_citation_prompt(context: str, query: str) -> str:
