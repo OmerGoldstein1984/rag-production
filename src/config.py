@@ -117,6 +117,41 @@ class Settings:
     key_warn_days: int = 14                          # days before expiry to start warning
     # Optional API bearer token. If set, mutating endpoints require it.
     api_token: str = ""                              # auth token for mutating API endpoints
+    # Scoped API keys: comma-separated "key_id:secret" pairs.
+    api_keys: tuple = ()                             # scoped API keys (id:secret)
+    api_key_expiry_days: int = 90                    # days before a key expires
+    api_key_required: bool = True                    # fail closed: require a key on all endpoints
+    # JWT signing
+    jwt_secret: str = ""
+    jwt_algorithm: str = "HS256"
+    jwt_expiry_seconds: int = 900
+    # Rate limiting
+    rate_limit_enabled: bool = True                  # enable rate limiting
+    rate_limit_backend: str = "memory"               # "memory" or "redis"
+    redis_url: str = "redis://localhost:6379/0"      # Redis connection URL
+    rate_limit_default_max: int = 30                 # default requests per window
+    rate_limit_default_window: int = 60              # default window seconds
+    rate_limit_client_ttl_seconds: int = 3600        # evict idle clients after TTL
+    # Per-endpoint limits: dict endpoint_path -> "max:window" (overrides defaults)
+    rate_limit_endpoints: dict = None                # e.g. {"/ingest": "10:60", "/agent/ask": "5:60"}
+    # PII / secrets
+    pii_redaction_enabled: bool = True               # redact PII from answers and logs
+    # Security headers / CORS
+    security_headers_enabled: bool = True            # emit HSTS, CSP, etc.
+    cors_allowed_origins: str = ""                   # comma-separated allowed origins
+    audit_log_enabled: bool = True                   # write structured audit events
+    # Input validation / resilience
+    max_request_body_bytes: int = 1048576            # 1 MB max request body
+    max_query_length: int = 2000                     # max query characters
+    max_top_k: int = 20                              # max retrieval top_k
+    max_chunk_size: int = 2000                       # max chunk size for ingestion
+    max_chunk_overlap: int = 500                     # max chunk overlap
+    max_upload_bytes: int = 10485760                 # 10 MB max upload
+    allowed_upload_extensions: str = ".pdf,.docx,.md,.txt,.csv"  # allowed upload extensions
+    llm_request_timeout_s: float = 30.0              # per-LLM-call timeout seconds
+    llm_max_retries: int = 3                         # max retries on transient LLM failure
+    llm_retry_backoff_base: float = 1.0              # base backoff seconds
+    agent_wall_clock_timeout_s: float = 60.0         # overall agent wall-clock timeout
 
     @property
     def is_real_provider(self) -> bool:
@@ -209,4 +244,55 @@ def get_settings() -> Settings:
         alert_email_to=os.environ.get("ALERT_EMAIL_TO", ""),
         key_warn_days=int(os.environ.get("KEY_WARN_DAYS", "14")),
         api_token=os.environ.get("API_TOKEN", ""),
+        # Scoped API keys / auth (comma-separated "key_id:secret" pairs)
+        api_keys=tuple(k.strip() for k in os.environ.get("API_KEYS", "").split(",") if k.strip()),
+        jwt_secret=os.environ.get("JWT_SECRET", ""),
+        jwt_algorithm=os.environ.get("JWT_ALGORITHM", "HS256"),
+        jwt_expiry_seconds=int(os.environ.get("JWT_EXPIRY_SECONDS", "900")),
+        # Rate limiting
+        rate_limit_enabled=os.environ.get("RATE_LIMIT_ENABLED", "true").lower() == "true",
+        rate_limit_backend=os.environ.get("RATE_LIMIT_BACKEND", "memory"),
+        redis_url=os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
+        rate_limit_default_max=int(os.environ.get("RATE_LIMIT_DEFAULT_MAX", "30")),
+        rate_limit_default_window=int(os.environ.get("RATE_LIMIT_DEFAULT_WINDOW", "60")),
+        rate_limit_client_ttl_seconds=int(os.environ.get("RATE_LIMIT_CLIENT_TTL_SECONDS", "3600")),
+        rate_limit_endpoints=_parse_endpoint_limits(os.environ.get("RATE_LIMIT_ENDPOINTS", "")),
+        # PII / security headers / CORS
+        pii_redaction_enabled=os.environ.get("PII_REDACTION_ENABLED", "true").lower() == "true",
+        security_headers_enabled=os.environ.get("SECURITY_HEADERS_ENABLED", "true").lower() == "true",
+        cors_allowed_origins=os.environ.get("CORS_ALLOWED_ORIGINS", ""),
+        audit_log_enabled=os.environ.get("AUDIT_LOG_ENABLED", "true").lower() == "true",
+        # Input validation / resilience
+        max_request_body_bytes=int(os.environ.get("MAX_REQUEST_BODY_BYTES", "1048576")),
+        max_query_length=int(os.environ.get("MAX_QUERY_LENGTH", "2000")),
+        max_top_k=int(os.environ.get("MAX_TOP_K", "20")),
+        max_chunk_size=int(os.environ.get("MAX_CHUNK_SIZE", "2000")),
+        max_chunk_overlap=int(os.environ.get("MAX_CHUNK_OVERLAP", "500")),
+        max_upload_bytes=int(os.environ.get("MAX_UPLOAD_BYTES", "10485760")),
+        allowed_upload_extensions=os.environ.get("ALLOWED_UPLOAD_EXTENSIONS", ".pdf,.docx,.md,.txt,.csv"),
+        llm_request_timeout_s=float(os.environ.get("LLM_REQUEST_TIMEOUT_S", "30")),
+        llm_max_retries=int(os.environ.get("LLM_MAX_RETRIES", "3")),
+        llm_retry_backoff_base=float(os.environ.get("LLM_RETRY_BACKOFF_BASE", "1.0")),
+        agent_wall_clock_timeout_s=float(os.environ.get("AGENT_WALL_CLOCK_TIMEOUT_S", "60")),
     )
+
+
+def _parse_endpoint_limits(raw: str) -> dict:
+    """Parse a comma-separated list of endpoint:max:window limits.
+
+    Example: "/ingest:10:60,/agent/ask:5:60" -> {"/ingest": "10:60", "/agent/ask": "5:60"}
+    Returns None when empty (use defaults).
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    out = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        parts = item.split(":")
+        if len(parts) == 3:
+            out[parts[0]] = f"{parts[1]}:{parts[2]}"
+    return out or None
+

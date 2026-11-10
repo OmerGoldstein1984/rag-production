@@ -59,6 +59,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from src.security.redaction import redact_dict, redact_text as redact_pii
+
 # --- correlation id -------------------------------------------------------
 
 # ContextVar holding the current request (correlation) ID for the lifetime of a
@@ -150,6 +152,8 @@ def redact(text: Any) -> str:
     s = text if isinstance(text, str) else json.dumps(text, default=str)
     for rx in _SECRET_PATTERNS:
         s = rx.sub("[REDACTED]", s)
+    # Also scrub PII (emails, phones, IMSI/IMEI, customer IDs, IP addresses).
+    s = redact_pii(s)
     return s
 
 
@@ -349,7 +353,7 @@ class Trace:
             "total_ms": round(self.total_ms, 2),
             "error": self.error,
             "stages": [
-                {"stage": s.stage, "duration_ms": round(s.duration_ms, 2), **s.detail}
+                {"stage": s.stage, "duration_ms": round(s.duration_ms, 2), **redact_dict(s.detail)}
                 for s in self.spans
             ],
         }
@@ -490,3 +494,72 @@ def get_recent_traces(limit: int = 20) -> List[Dict[str, Any]]:
     """Return the most recent `limit` traces as dicts (newest last)."""
     with _trace_lock:
         return list(_traces[-limit:])
+
+
+# --- security audit logging --------------------------------------------------
+
+@dataclass
+class AuditEvent:
+    """One security-relevant event: who did what, when, where, with what outcome."""
+
+    timestamp: float
+    actor: str            # client_id / key_id / role
+    action: str           # e.g. "auth_failure", "rate_limit_block", "ingest", "delete"
+    endpoint: str         # e.g. "/ask", "/ingest"
+    detail: Dict[str, Any]  # redacted context (query hash, tool, etc.)
+    outcome: str          # "allowed", "blocked", "error"
+
+
+class AuditLogger:
+    """Bounded ring buffer of security audit events."""
+
+    def __init__(self, limit: int = 1000):
+        self.limit = limit
+        self.events: List[AuditEvent] = []
+        self._lock = threading.Lock()
+
+    def log(self, actor: str, action: str, endpoint: str,
+            detail: Optional[Dict[str, Any]] = None, outcome: str = "allowed") -> None:
+        event = AuditEvent(
+            timestamp=time.time(),
+            actor=actor,
+            action=action,
+            endpoint=endpoint,
+            detail=redact_dict(detail or {}),
+            outcome=outcome,
+        )
+        with self._lock:
+            self.events.append(event)
+            if len(self.events) > self.limit:
+                del self.events[: len(self.events) - self.limit]
+
+    def snapshot(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [
+                {
+                    "timestamp": round(e.timestamp, 3),
+                    "actor": e.actor,
+                    "action": e.action,
+                    "endpoint": e.endpoint,
+                    "detail": e.detail,
+                    "outcome": e.outcome,
+                }
+                for e in self.events
+            ]
+
+
+# Global audit logger (imported by src/api/main.py).
+audit_logger = AuditLogger()
+
+
+def log_security_event(actor: str, action: str, endpoint: str,
+                       detail: Optional[Dict[str, Any]] = None,
+                       outcome: str = "allowed") -> None:
+    """Record a security-relevant event (auth failure, rate-limit block, ingest,
+    delete, prompt-injection block, PII redaction)."""
+    audit_logger.log(actor, action, endpoint, detail, outcome)
+
+
+def get_recent_audit_events(limit: int = 100) -> List[Dict[str, Any]]:
+    """Return the most recent `limit` audit events."""
+    return audit_logger.snapshot()[-limit:]

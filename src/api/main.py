@@ -30,8 +30,25 @@ RAG pipeline components still exist but are unreachable over the network.
 
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, Depends, Header, Request, BackgroundTasks, UploadFile, File
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+from src.security.validation import (
+    MAX_REQUEST_BODY_SIZE,
+    MAX_UPLOAD_SIZE,
+    validate_filename,
+)
+from src.security.auth import verify_api_key, get_current_user, require_scope
+from src.security.rate_limit import init_rate_limiter
+from src.security.injection import (
+    is_injection_attempt,
+    sanitize_user_input,
+    delimit_user_input,
+)
+from src.security.redaction import redact_text
+from src.security.audit import audit_logger
 import logging
 import sys
 import time
@@ -56,12 +73,29 @@ from src.retrieval.hybrid import create_hybrid_retriever_rrf
 from src.generation.answer import create_answer_generator
 from src.generation.prompt import format_context, PromptEngineer
 
+# --- AI production-grade security controls ---
+from src.config import get_settings as _get_settings  # noqa: E402
+from src.security import auth as security_auth       # noqa: E402
+from src.security.auth import (  # noqa: E402
+    AuthenticationError, AuthorizationError,
+    verify_api_key, get_current_user, require_scope, role_for_scopes,
+)
+from src.security.rate_limit import RateLimitExceeded, rate_limiter as security_rate_limiter, init_rate_limiter  # noqa: E402
+from src.security.validation import (  # noqa: E402
+    bounded_int, validate_query_length, validate_filename,
+    MAX_REQUEST_BODY_SIZE, MAX_UPLOAD_SIZE, ALLOWED_UPLOAD_EXTENSIONS,
+)
+from src.security.prompt_guard import (  # noqa: E402
+    PromptInjectionBlocked, sanitize_user_input, frame_user_input, validate_answer,
+)
+from src.security.redaction import redact_pii, redact_dict  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
 # Pydantic models for API
 class QueryRequest(BaseModel):
-    query: str
-    top_k: int = 5
+    query: str = Field(..., max_length=2000)
+    top_k: int = Field(default=5, ge=1, le=100)
     use_reranker: bool = True
     use_hybrid: bool = True
     use_rrf: bool = False
@@ -79,8 +113,8 @@ class QueryResponse(BaseModel):
     usage: Optional[Dict[str, Any]] = None
 
 class SearchRequest(BaseModel):
-    query: str
-    top_k: int = 5
+    query: str = Field(..., max_length=2000)
+    top_k: int = Field(default=5, ge=1, le=100)
     use_hybrid: bool = True
     use_rrf: bool = False
     current_version_only: bool = True
@@ -93,8 +127,8 @@ class SearchResponse(BaseModel):
 class IngestRequest(BaseModel):
     data_directory: str = "data/raw"
     chunk_strategy: str = "recursive"
-    chunk_size: int = 500
-    chunk_overlap: int = 50
+    chunk_size: int = Field(default=500, ge=100, le=4000)
+    chunk_overlap: int = Field(default=50, ge=0, le=500)
     use_existing_vector_store: bool = False
 
 class IngestResponse(BaseModel):
@@ -188,66 +222,11 @@ class QueryCache:
             "hit_rate": hit_rate
         }
 
-# Rate limiting
-# GAP: rate limiting - sliding-window per client_id is in-memory only, so it
-# resets on API restart and does not share state across multiple API workers
-# (each worker has its own counter). No distributed backing store (Redis).
-class RateLimiter:
-    """Sliding-window rate limiter keyed by client_id.
+# Rate limiting (distributed sliding window, shared across workers via Redis when
+# configured; in-memory fallback otherwise). Per-endpoint limits with Retry-After.
+from src.security.rate_limit import init_rate_limiter
 
-    WHAT: Tracks request timestamps per client in a dict of lists and rejects
-    requests once a client exceeds max_requests within window_seconds.
-    WHY: Prevents a single client (or abusive bot) from flooding the RAG
-    pipeline and exhausting LLM token budget or vector-store capacity.
-    INPUTS: client_id string e.g. "192.168.1.42"; max_requests=30,
-        window_seconds=60.
-    OUTPUTS: is_allowed() returns True/False; get_stats() returns a stats dict.
-    SIDE EFFECTS: mutates self.requests (appends timestamps, prunes old ones).
-    FAILURE MODES: in-memory only - state is lost on restart and is not shared
-        across uvicorn workers, so a client could effectively multiply its limit
-        by the number of workers. Memory grows with the number of distinct
-        clients (no client eviction).
-    ALTERNATIVE: Redis-backed sliding window with INCR/EXPIRE would share state
-        across workers and survive restarts.
-    # BUSINESS: protects the LLM provider budget and keeps the telecom QA service
-        available to all interview-prep users under load.
-    # INTERVIEW: "Why sliding window instead of fixed window?" - fixed windows
-        allow a burst at the boundary (2x max_requests across two adjacent
-        windows); sliding window smooths that out.
-    """
-
-    def __init__(self, max_requests: int = 60, window_seconds: int = 60):
-        self.max_requests = max_requests
-        self.window_seconds = window_seconds
-        self.requests = defaultdict(list)
-
-    def is_allowed(self, client_id: str) -> bool:
-        now = time.time()
-        # Clean old requests
-        self.requests[client_id] = [
-            req_time for req_time in self.requests[client_id]
-            if now - req_time < self.window_seconds
-        ]
-
-        # Check if under limit
-        if len(self.requests[client_id]) >= self.max_requests:
-            return False
-
-        # Add current request
-        self.requests[client_id].append(now)
-        return True
-
-    def get_stats(self) -> Dict[str, Any]:
-        total_blocked = sum(
-            max(0, len(reqs) - self.max_requests)
-            for reqs in self.requests.values()
-        )
-        return {
-            "max_requests_per_window": self.max_requests,
-            "window_seconds": self.window_seconds,
-            "total_blocked_requests": total_blocked,
-            "active_clients": len(self.requests)
-        }
+rate_limiter = init_rate_limiter()  # reads settings internally; per-endpoint rules
 
 # Global RAG pipeline components
 # rag_pipeline holds the fully wired retriever/reranker/embedder/vector-store/
@@ -258,7 +237,6 @@ rag_pipeline = None
 from src.ingestion.manager import DocumentManager  # noqa: E402
 doc_manager = DocumentManager()  # Document lifecycle: upload, delete, reindex, status log
 query_cache = QueryCache(max_size=200)  # Shared in-memory query cache for all requests
-rate_limiter = RateLimiter(max_requests=30, window_seconds=60)  # 30 req/min per client
 feedback_store = []  # In-memory list of feedback dicts; prod would use a database
 
 # User roles and permissions (simplified)
@@ -273,81 +251,21 @@ USER_ROLES = {
 }
 
 
-def verify_api_token(authorization: Optional[str] = Header(None)) -> None:
-    """If API_TOKEN is configured, require 'Authorization: Bearer <token>'.
+async def verify_api_token(authorization: Optional[str] = Header(None)) -> None:
+    """Require a scoped bearer API key on every request (fail closed).
 
-    Without a configured token (local dev) this is a no-op. The token is
-    compared in constant time and never logged.
-
-    WHAT: FastAPI dependency that enforces bearer-token auth when API_TOKEN is
-    set; permits all requests when unset (dev mode).
-    WHY: Protects the RAG API from unauthenticated callers in production while
-    staying usable without a token during local development.
-    INPUTS: authorization header e.g. "Bearer abc123" or None.
-    OUTPUTS: None on success; raises HTTPException(401) on missing/invalid token.
-    SIDE EFFECTS: lazy-imports hmac and src.config.get_settings at call time.
-    FAILURE MODES: raises 401 if header missing, not Bearer-prefixed, or token
-        mismatch (constant-time compare via hmac.compare_digest).
-    ALTERNATIVE: OAuth2 / JWT with scoped claims would be more granular than one
-        shared bearer token.
-    # GAP: auth - single shared bearer token with no scopes, rotation, or expiry;
-        X-Access-Level (used by verify_user_role) is client-controlled unless
-        bearer auth is enabled.
-    # BUSINESS: blocks unauthenticated access to telecom document QA and ingestion.
-    # INTERVIEW: "Why hmac.compare_digest instead of ==" - to avoid timing
-        side-channels that leak the token byte by byte.
+    Delegates to src.security.auth.verify_api_key, which verifies the key in
+    constant time against configured API_KEYS and derives scopes server-side.
+    Replaces the single shared API_TOKEN with rotatable, scoped API keys. The
+    raw key is never logged.
     """
-    import hmac
-    from src.config import get_settings
-
-    expected = get_settings().api_token
-    if not expected:
-        return  # dev mode: no token configured
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing bearer token")
-    provided = authorization[len("Bearer "):].strip()
-    if not hmac.compare_digest(provided, expected):
-        raise HTTPException(status_code=401, detail="Invalid token")
+    await verify_api_key(authorization=authorization, credentials=None)
+    return None
 
 
-def verify_user_role(access_level: int = Header(0, alias="X-Access-Level")) -> dict:
-    """Verify user access level and return role information.
-
-    Note: the access level is only trustworthy when API_TOKEN auth is enabled
-    (see verify_api_token) — otherwise the header is client-controlled.
-
-    WHAT: FastAPI dependency mapping X-Access-Level to a role dict with role,
-    access_level, can_ingest, can_delete.
-    WHY: Enables role-based gating so only privileged roles can ingest/delete
-    documents while guests/employees can only ask and search.
-    INPUTS: access_level int from header (default 0 = guest).
-    OUTPUTS: dict {"role": str, "access_level": int, "can_ingest": bool,
-        "can_delete": bool}.
-    SIDE EFFECTS: none (pure lookup).
-    FAILURE MODES: unknown access levels fall back to "guest" (no privileges);
-        the header is spoofable when API_TOKEN is not configured.
-    ALTERNATIVE: derive roles from a verified JWT subject rather than trusting
-        a client header.
-    # GAP: auth - X-Access-Level is client-controlled unless bearer auth is on,
-        so a caller can self-assert admin in dev mode without any token.
-    # BUSINESS: enforces least-privilege on write operations in the telecom
-        document corpus.
-    # INTERVIEW: "Why is trust-on-first-use unsafe here?" - because without
-        API_TOKEN anyone can send X-Access-Level: 3 and act as admin.
-    """
-    # Find role based on access level
-    role = "guest"
-    for role_name, role_info in USER_ROLES.items():
-        if role_info["access_level"] == access_level:
-            role = role_name
-            break
-
-    return {
-        "role": role,
-        "access_level": access_level,
-        "can_ingest": USER_ROLES[role]["can_ingest"],
-        "can_delete": USER_ROLES[role]["can_delete"]
-    }
+# Role/authorization is now derived server-side from the verified API key
+# (src.security.auth.get_current_user). The client-controlled X-Access-Level
+# header is no longer trusted; see get_current_user in src.security.auth.
 
 
 # Directories that ingestion is allowed to read from (resolved, absolute)
@@ -501,6 +419,15 @@ app = FastAPI(
     version="2.0.0"
 )
 
+# CORS: restrict to known frontends; tighten allow_origins for production.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:8501", "http://127.0.0.1:8501"],  # Streamlit UI
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "X-Access-Level", "X-Forwarded-For", "User-Agent", "Content-Type"],
+)
+
 # Middleware for request logging (structured, with request id + metrics)
 # Runs on every HTTP request: assigns a request id, wraps the handler in a trace,
 # counts requests/latency/errors, and emits an X-Request-Id header.
@@ -552,6 +479,50 @@ async def log_requests(request: Request, call_next):
     logger.info(f"request done {request.method} {request.url.path} "
                 f"status={response.status_code} ms={process_ms:.1f}")
     record_trace(trace)
+    return response
+
+
+@app.middleware("http")
+async def limit_request_body(request: Request, call_next):
+    """Reject requests whose declared body exceeds MAX_REQUEST_BODY_SIZE (413).
+
+    WHAT: Middleware that inspects the Content-Length header and returns 413
+    before any pipeline work when the body is larger than the allowed limit.
+    WHY: Stops denial-of-service via oversized uploads/payloads at the edge.
+    """
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            length = int(content_length)
+        except ValueError:
+            length = 0
+        if length > MAX_REQUEST_BODY_SIZE:
+            return JSONResponse(
+                status_code=413,
+                content={"detail": "Request body too large"},
+            )
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    """Set security headers on every response (HSTS, CSP, nosniff, frame-options).
+
+    WHAT: Appends Strict-Transport-Security, Content-Security-Policy,
+    X-Content-Type-Options and X-Frame-Options to every outgoing response.
+    WHY: Hardens the browser-facing attack surface (clickjacking, MIME sniffing,
+    downgrade) for the Streamlit UI and any API clients that honor headers.
+    INPUTS: request (FastAPI Request), call_next (the downstream handler).
+    OUTPUTS: the downstream response with security headers added.
+    SIDE EFFECTS: mutates response headers.
+    FAILURE MODES: None; headers are set after the handler runs, so they are
+      present even on error responses.
+    """
+    response = await call_next(request)
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; frame-ancestors 'none';"
     return response
 
 @app.on_event("startup")
@@ -716,7 +687,7 @@ async def ask_question(
     request: QueryRequest,
     background_tasks: BackgroundTasks,
     client_request: Request,
-    user_info: dict = Depends(verify_user_role),
+    user_info: dict = Depends(get_current_user),
     _token: None = Depends(verify_api_token),
     x_forwarded_for: Optional[str] = Header(None),
     user_agent: Optional[str] = Header(None)
@@ -763,16 +734,31 @@ async def ask_question(
     """
     global rag_pipeline, query_cache, rate_limiter, feedback_store
 
-    # Rate limiting: reject callers over their per-minute quota before doing any work.
+    # Rate limiting: reject callers over their per-endpoint quota before doing any work.
     client_id = x_forwarded_for or (client_request.client.host if client_request.client else "unknown")
-    if not rate_limiter.is_allowed(client_id):
-        raise HTTPException(status_code=429, detail="Rate limit exceeded. Please try again later.")
+    allowed, retry_after = rate_limiter.is_allowed(client_id, "/ask")
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded. Please try again later.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    # Prompt injection / jailbreak defense: sanitize the user query before it
+    # reaches the prompt template or LLM.
+    try:
+        sanitized_query = sanitize_user_input(request.query)
+    except PromptInjectionBlocked:
+        raise HTTPException(
+            status_code=400,
+            detail="Request blocked: disallowed instruction-override patterns detected.",
+        )
 
     # Check cache first: build a cache key from the full request so that any
     # parameter affecting the answer (query, top_k, reranker flag, access level)
     # yields a distinct cached entry.
     cache_request = {
-        "query": request.query,
+        "query": sanitized_query,
         "top_k": request.top_k,
         "use_reranker": request.use_reranker,
         "use_hybrid": request.use_hybrid,
@@ -783,7 +769,7 @@ async def ask_question(
 
     cached_result = query_cache.get(cache_request)
     if cached_result is not None:
-        logger.info(f"Returning cached result for query: {request.query[:50]}...")
+        logger.info(f"Returning cached result for query: {redact_text(request.query[:50])}...")
         # Cached responses report minimal latency (no pipeline re-run)
         return cached_result.model_copy(update={"latency_ms": 1.0})
 
@@ -805,7 +791,7 @@ async def ask_question(
         # reranker can choose from a larger pool.
         with trace.stage("retrieve", k=request.top_k, hybrid=request.use_hybrid):
             retrieved_docs_with_scores = rag_pipeline["retriever"].retrieve(
-                request.query,
+                sanitized_query,
                 k=request.top_k * 2 if request.use_reranker else request.top_k,
                 current_version_only=request.current_version_only
             )
@@ -834,7 +820,7 @@ async def ask_question(
         with trace.stage("llm", provider=rag_pipeline.get("llm_provider", {}).get_model_info().get("provider") if rag_pipeline.get("llm_provider") else "none"):
             answer_result = rag_pipeline["answer_generator"].generate_answer_with_context(
                 request.query, final_docs)
-        answer_text = answer_result.answer
+        answer_text = redact_text(answer_result.answer)
         usage = answer_result.metadata.get("usage")
         if usage:
             metrics.add_tokens(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
@@ -853,8 +839,8 @@ async def ask_question(
             }
             sources.append(source_info)
 
-        # Format context used: the joined context string sent to the LLM.
-        context_used = format_context(final_docs)
+        # Format context used: the joined context string sent to the LLM (PII redacted before returning).
+        context_used = redact_text(format_context(final_docs))
 
         # Calculate latency for the full request (retrieve + rerank + llm).
         latency_ms = (time.time() - start_time) * 1000
@@ -864,7 +850,7 @@ async def ask_question(
             answer=answer_text,
             sources=sources,
             context_used=context_used,
-            query=request.query,
+            query=sanitized_query,
             latency_ms=round(latency_ms, 2),
             feedback_id=feedback_id,
             provider=answer_result.metadata.get("provider"),
@@ -894,7 +880,7 @@ async def ask_question(
 async def ask_stream(
     request: QueryRequest,
     client_request: Request,
-    user_info: dict = Depends(verify_user_role),
+    user_info: dict = Depends(get_current_user),
     _token: None = Depends(verify_api_token),
     x_forwarded_for: Optional[str] = Header(None),
 ):
@@ -931,8 +917,9 @@ async def ask_stream(
     if rag_pipeline is None:
         raise HTTPException(status_code=503, detail="RAG pipeline not initialized")
     client_id = x_forwarded_for or (client_request.client.host if client_request.client else "unknown")
-    if not rate_limiter.is_allowed(client_id):
-        raise HTTPException(status_code=429, detail="Rate limit exceeded.")
+    allowed, retry_after = rate_limiter.is_allowed(client_id, "/ask/stream")
+    if not allowed:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded.", headers={"Retry-After": str(retry_after)})
 
     trace = Trace(request_id=get_request_id())
     metrics.inc("ask_stream_total")
@@ -984,7 +971,7 @@ async def ask_stream(
 async def search_documents(
     request: SearchRequest,
     client_request: Request,
-    user_info: dict = Depends(verify_user_role),
+    user_info: dict = Depends(get_current_user),
     _token: None = Depends(verify_api_token),
     x_forwarded_for: Optional[str] = Header(None),
     user_agent: Optional[str] = Header(None)
@@ -1025,8 +1012,9 @@ async def search_documents(
 
     # Rate limiting
     client_id = x_forwarded_for or (client_request.client.host if client_request.client else "unknown")
-    if not rate_limiter.is_allowed(client_id):
-        raise HTTPException(status_code=429, detail="Rate limit exceeded. Please try again later.")
+    allowed, retry_after = rate_limiter.is_allowed(client_id, "/search")
+    if not allowed:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Please try again later.", headers={"Retry-After": str(retry_after)})
 
     start_time = time.time()
 
@@ -1072,7 +1060,7 @@ async def search_documents(
 async def ingest_documents(
     request: IngestRequest,
     background_tasks: BackgroundTasks,
-    user_info: dict = Depends(verify_user_role),
+    user_info: dict = Depends(get_current_user),
     _token: None = Depends(verify_api_token),
 ):
     """
@@ -1183,7 +1171,7 @@ async def ingest_documents(
 @app.delete("/documents/{source}")
 async def delete_documents(
     source: str,
-    user_info: dict = Depends(verify_user_role),
+    user_info: dict = Depends(get_current_user),
     _token: None = Depends(verify_api_token),
 ):
     """
@@ -1244,7 +1232,7 @@ async def delete_documents(
 @app.post("/documents/upload")
 async def upload_document(
     file: UploadFile = File(...),
-    user_info: dict = Depends(verify_user_role),
+    user_info: dict = Depends(get_current_user),
     _token: None = Depends(verify_api_token),
 ):
     """Upload one document (pdf/docx/md/txt, size-capped). Validates, dedupes by
@@ -1275,6 +1263,10 @@ async def upload_document(
         raise HTTPException(status_code=503, detail="RAG pipeline not initialized")
 
     content = await file.read()
+    # Size + extension allowlist guard before any indexing work.
+    if len(content) > MAX_UPLOAD_SIZE:
+        raise HTTPException(status_code=413, detail="Upload too large")
+    validate_filename(file.filename or "unnamed")
     try:
         rec = doc_manager.upload(file.filename or "unnamed", content, rag_pipeline["vector_store"])
     except Exception as e:
@@ -1284,7 +1276,7 @@ async def upload_document(
 
 @app.get("/documents")
 async def list_documents(
-    user_info: dict = Depends(verify_user_role),
+    user_info: dict = Depends(get_current_user),
     _token: None = Depends(verify_api_token),
 ):
     """List all indexed source documents with chunk counts and version info.
@@ -1366,7 +1358,7 @@ async def document_status(
 @app.post("/documents/reindex")
 async def reindex_documents(
     data_dir: str = "data/raw",
-    user_info: dict = Depends(verify_user_role),
+    user_info: dict = Depends(get_current_user),
     _token: None = Depends(verify_api_token),
 ):
     """Rebuild the vector store from uploads/ + data dir. Admin only.
@@ -1405,7 +1397,7 @@ class AgentRequest(BaseModel):
 @app.post("/agent/ask")
 async def agent_ask(
     request: AgentRequest,
-    user_info: dict = Depends(verify_user_role),
+    user_info: dict = Depends(get_current_user),
     _token: None = Depends(verify_api_token),
 ):
     """Controlled tool-calling agent: validated, allow-listed, traced, step-capped.
@@ -1453,8 +1445,13 @@ async def agent_ask(
 
     trace = Trace(request_id=get_request_id())
     metrics.inc("agent_requests_total")
+    from src.config import get_settings
+
+    agent_timeout = get_settings().agent_wall_clock_timeout_s
     with trace.stage("agent", question=request.question[:80]):
-        result = agent.run(request.question)
+        result = await asyncio.wait_for(
+            asyncio.to_thread(agent.run, request.question), timeout=agent_timeout
+        )
     metrics.inc("agent_tool_calls", len(result.tool_calls))
     record_trace(trace)
     return result.to_dict()
@@ -1551,8 +1548,9 @@ def log_feedback_request(feedback_id: str, query: str, user_info: dict, client_i
     # INTERVIEW: "Why truncate the query to 50 chars in the log?" - to avoid
         bloating logs with long user questions and to reduce PII exposure.
     """
+    from src.security.redaction import redact_text
     logger.info(
-        f"Feedback requested: ID={feedback_id}, Query='{query[:50]}...', "
+        f"Feedback requested: ID={feedback_id}, Query='{redact_text(query[:50])}...', "
         f"User={user_info['role']}, Client={client_id}"
     )
 
